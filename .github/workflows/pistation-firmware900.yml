@@ -3,7 +3,7 @@ name: PiStation firmware diagnostics
 
 on:
   push:
-    branches: [feature/dashboard-900, feature/dashboard-900-phase2, feature/dashboard-900-phase3]
+    branches: [feature/dashboard-900, feature/dashboard-900-phase2, feature/dashboard-900-phase3, feature/dashboard-900-phase4, fix/dashboard-900-windows-vfs]
     paths:
       - 'tools/firmware900/**'
       - 'src/core/loader/elf*.h'
@@ -45,3 +45,21 @@ jobs:
           cmake -S tools/firmware900 -B build/scanner-sanitized -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14 -DPISTATION_NATIVE_REGISTRY_TESTS=ON '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
           cmake --build build/scanner-sanitized --parallel 2
           UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/scanner-sanitized --output-on-failure
+
+  windows-scanner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure MSVC diagnostics
+        run: cmake -S tools/firmware900 -B build-firmware900 -DPISTATION_ENABLE_TESTS=ON
+      - name: Build Debug
+        run: cmake --build build-firmware900 --config Debug --parallel 2
+      - name: Test Debug including Win32 VFS
+        run: ctest --test-dir build-firmware900 -C Debug --output-on-failure
+      - name: Build Release
+        run: cmake --build build-firmware900 --config Release --parallel 2
+      - name: Test Release
+        run: ctest --test-dir build-firmware900 -C Release --output-on-failure

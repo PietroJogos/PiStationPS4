@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -11,9 +12,14 @@ namespace PiStation {
 
 class ReadOnlyFirmwareVfs {
 public:
+#ifdef _WIN32
+    using NativeHandle = std::intptr_t;
+#else
+    using NativeHandle = int;
+#endif
     class File {
     public:
-        File(int descriptor, std::uint64_t size);
+        File(NativeHandle descriptor, std::uint64_t size);
         ~File();
         File(const File&) = delete;
         File& operator=(const File&) = delete;
@@ -24,7 +30,10 @@ public:
 
     private:
         friend class ReadOnlyFirmwareVfs;
-        int descriptor = -1;
+        NativeHandle descriptor = -1;
+#ifdef _WIN32
+        std::shared_ptr<File> parent;
+#endif
         std::uint64_t size{};
     };
 
@@ -45,6 +54,9 @@ public:
     File OpenVirtual(std::string_view path) const;
 
 private:
+#ifdef _WIN32
+    File OpenWindowsPath(const std::filesystem::path& path, bool directory) const;
+#endif
     File root;
     struct MountPoint {
         std::string virtual_root;

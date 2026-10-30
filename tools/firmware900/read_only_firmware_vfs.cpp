@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "firmware_vfs_paths.h"
 #include "read_only_firmware_vfs.h"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #endif
 
 namespace PiStation {
+using namespace VfsPaths;
 namespace {
 
 void Close(int descriptor) {
@@ -26,35 +28,6 @@ void Close(int descriptor) {
 #else
     (void)descriptor;
 #endif
-}
-
-void ValidateRelative(const std::filesystem::path& path) {
-    if (path.is_absolute() || path.has_root_name() || path.native().size() > 4096) {
-        throw std::runtime_error("VFS requires a relative host path");
-    }
-    std::size_t depth{};
-    for (const auto& component : path) {
-        if (++depth > 64) {
-            throw std::runtime_error("VFS path depth exceeds diagnostic limit");
-        }
-        if (component == ".." || component.native().find('\0') != std::string::npos) {
-            throw std::runtime_error("VFS path traversal or NUL rejected");
-        }
-    }
-}
-
-std::string ValidateVirtual(std::string_view path) {
-    if (path.empty() || path.size() > 4096 || path.front() != '/' || path.starts_with("//") ||
-        path.find('\\') != std::string_view::npos || path.find('\0') != std::string_view::npos) {
-        throw std::runtime_error("VFS requires an absolute guest path without backslashes or NUL");
-    }
-    const std::filesystem::path value{path};
-    ValidateRelative(value.relative_path());
-    auto normalized = value.lexically_normal().generic_string();
-    while (normalized.size() > 1 && normalized.back() == '/') {
-        normalized.pop_back();
-    }
-    return normalized;
 }
 
 } // namespace
