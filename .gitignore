@@ -1,0 +1,3 @@
+.cloud-env/
+build/
+CMakeUserPresets.json
