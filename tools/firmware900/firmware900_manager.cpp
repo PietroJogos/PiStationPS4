@@ -82,7 +82,7 @@ void Log(ScanReport& report, std::string category, std::string message) {
 
 void Inspect(ScanReport& report, const ReadOnlyFirmwareVfs& vfs,
              const std::filesystem::path& relative, std::uint64_t size,
-             std::size_t& total_dependencies, std::size_t& total_metadata) {
+             std::size_t& total_dependencies) {
     FileRecord file;
     file.path = relative;
     const auto quoted = Firmware900Manager::JsonString(Firmware900Manager::PathText(file.path));
@@ -112,7 +112,7 @@ void Inspect(ScanReport& report, const ReadOnlyFirmwareVfs& vfs,
         const auto prefix = reader.Read(0, std::min<std::uint64_t>(file.size, 4));
         if (prefix == std::vector<unsigned char>{0x7f, 'E', 'L', 'F'}) {
             file.kind = "ELF";
-            AnalyzeElfMetadata(reader, file);
+            AnalyzeElfMetadata(reader, file, report.parser_budget_remaining);
         } else if (prefix == std::vector<unsigned char>{0x4f, 0x15, 0x3d, 0x1d}) {
             file.kind = "SELF";
             ParseSelf(reader, file);
@@ -166,29 +166,15 @@ void Inspect(ScanReport& report, const ReadOnlyFirmwareVfs& vfs,
         Log(report, "ERROR", quoted + ": total dependency limit reached");
     }
     total_dependencies += file.dependencies.size();
-    bool clipped{};
-    const auto budget = [&](auto& values) {
-        const auto count = std::min(values.size(), std::size_t{16384} - total_metadata);
-        clipped |= count != values.size();
-        values.resize(count);
-        total_metadata += count;
-    };
-    budget(file.symbols);
-    budget(file.exported_libraries);
-    budget(file.exported_modules);
-    if (file.elf) {
-        budget(file.elf->segments);
-        if (file.elf->relocation_types.size() > 16384 - total_metadata) {
-            file.elf->relocation_types.clear();
-            clipped = true;
-        } else {
-            total_metadata += file.elf->relocation_types.size();
-        }
-    }
-    if (clipped) {
+    if (file.elf && file.elf->symbol_records_omitted) {
         report.complete = false;
-        file.symbol_status = "incomplete_metadata_limit";
-        Log(report, "ERROR", quoted + ": global metadata limit reached");
+        file.notes.emplace_back("Symbol retention byte budget reached; entries were checked but "
+                                "some records are omitted. Essential metadata was not discarded.");
+        Log(report, "ERROR",
+            quoted + ": symbol retention byte budget reached; analysis incomplete");
+        report.diagnostics.back().result = "diagnostic_limit_exceeded";
+        report.diagnostics.back().operation = "retain_symbols";
+        report.diagnostics.back().related = Firmware900Manager::PathText(file.path);
     }
     Log(report, "LOADER", quoted + " kind=" + file.kind + " status=" + file.status);
     if (file.kind == "ELF" || file.kind == "SELF") {
@@ -304,9 +290,11 @@ std::string Firmware900Manager::JsonString(const std::string& value) {
     return out.str();
 }
 
-ScanReport Firmware900Manager::Scan(const std::filesystem::path& directory,
-                                    std::size_t max_entries) const {
+ScanReport Firmware900Manager::Scan(const std::filesystem::path& directory, std::size_t max_entries,
+                                    ParserBudget parser_budget) const {
     ScanReport report;
+    report.parser_budget_initial = parser_budget;
+    report.parser_budget_remaining = parser_budget;
     Log(report, "PISTATION", "Firmware 9.00 Dashboard — Experimental: offline diagnostic mode");
     Log(report, "FIRMWARE900", "Firmware version, loader compatibility and boot are not validated");
     try {
@@ -314,15 +302,22 @@ ScanReport Firmware900Manager::Scan(const std::filesystem::path& directory,
             throw std::runtime_error(
                 "input must be an existing directory; entry limit must be positive");
         }
+        if (parser_budget.symbol_entries > ParserBudget::MaxSymbolEntries ||
+            parser_budget.relocation_entries > ParserBudget::MaxRelocationEntries ||
+            parser_budget.validation_steps > ParserBudget::MaxValidationSteps ||
+            parser_budget.symbol_bytes > ParserBudget::MaxSymbolBytes ||
+            parser_budget.structure_bytes > ParserBudget::MaxStructureBytes) {
+            throw std::runtime_error("parser budgets may only reduce the hard scan limits");
+        }
         report.root = std::filesystem::canonical(directory);
         report.input_valid = true;
         ReadOnlyFirmwareVfs vfs(report.root);
-        const auto listing = vfs.Enumerate(max_entries);
+        auto listing = vfs.Enumerate(max_entries);
+        std::ranges::sort(listing.files, {}, &ReadOnlyFirmwareVfs::Entry::path);
         report.complete = listing.complete;
         std::size_t total_dependencies{};
-        std::size_t total_metadata{};
         for (const auto& entry : listing.files) {
-            Inspect(report, vfs, entry.path, entry.size, total_dependencies, total_metadata);
+            Inspect(report, vfs, entry.path, entry.size, total_dependencies);
         }
         for (const auto& skipped : listing.skipped) {
             Log(report, "VFS", "symlink or special file skipped: " + JsonString(PathText(skipped)));
@@ -408,7 +403,21 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
         << "\"firmware_version_verified\":false,\"boot_attempted\":false,"
         << "\"symbol_resolution\":\"not_evaluated\",\"root\":\"<user-selected-directory>\""
         << ",\"input_valid\":" << report.input_valid << ",\"scan_complete\":" << report.complete
-        << ",\"error_count\":" << report.error_count << ",\"files\":[\n";
+        << ",\"error_count\":" << report.error_count;
+    const auto write_budget = [&](const ParserBudget& value) {
+        out << "{\"symbol_entries\":" << value.symbol_entries
+            << ",\"relocation_entries\":" << value.relocation_entries
+            << ",\"validation_steps\":" << value.validation_steps
+            << ",\"symbol_bytes\":" << value.symbol_bytes
+            << ",\"structure_bytes\":" << value.structure_bytes << '}';
+    };
+    out << ",\"parser_revision\":\"bounded-tables-v1\",\"parser_limits\":{\"chunk_entries\":"
+        << ParserBudget::ChunkEntries << ",\"max_file_symbols\":" << ParserBudget::MaxFileSymbols
+        << ",\"max_file_relocations\":" << ParserBudget::MaxFileRelocations << ",\"initial\":";
+    write_budget(report.parser_budget_initial);
+    out << ",\"remaining\":";
+    write_budget(report.parser_budget_remaining);
+    out << "},\"files\":[\n";
     bool first = true;
     for (const auto& file : report.files) {
         if (!std::exchange(first, false)) {
@@ -427,6 +436,11 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
                 << ",\"entry_in_executable_segment\":" << file.elf->entry_in_executable_segment
                 << ",\"tls_present\":" << file.elf->tls_present
                 << ",\"symbol_table_entries\":" << file.elf->symbol_table_entries
+                << ",\"symbol_entries_examined\":" << file.elf->symbol_entries_examined
+                << ",\"symbol_records_omitted\":" << file.elf->symbol_records_omitted
+                << ",\"relocation_table_entries\":" << file.elf->relocation_table_entries
+                << ",\"relocation_entries_examined\":" << file.elf->relocation_entries_examined
+                << ",\"segments_validated\":" << file.elf->segments_validated
                 << ",\"relocation_status\":" << JsonString(file.elf->relocation_status)
                 << ",\"relocation_types\":{";
             bool first_type = true;
@@ -579,11 +593,21 @@ void Firmware900Manager::WriteTextReport(const ScanReport& report,
         throw std::runtime_error("cannot create text report; output must be new");
     }
     out << "Firmware 9.00 Dashboard — Experimental\nOffline metadata only. Boot disabled. "
-           "Firmware version and runtime symbol resolution not verified.\n";
+           "Firmware version and runtime symbol resolution not verified.\n"
+           "Parser revision: bounded-tables-v1; table chunk: 1024 entries.\n"
+        << "Remaining scan work: symbols=" << report.parser_budget_remaining.symbol_entries
+        << " relocations=" << report.parser_budget_remaining.relocation_entries
+        << " segment_checks=" << report.parser_budget_remaining.validation_steps
+        << " symbol_storage_bytes=" << report.parser_budget_remaining.symbol_bytes
+        << " essential_storage_bytes=" << report.parser_budget_remaining.structure_bytes << '\n';
     for (const auto& file : report.files) {
         out << "\n" << JsonString(PathText(file.path)) << " [" << file.kind << "] " << file.status;
         if (file.elf) {
-            out << " entry=" << Hex(file.elf->entry) << " tls=" << file.elf->tls_present;
+            out << " entry=" << Hex(file.elf->entry) << " tls=" << file.elf->tls_present
+                << " symbol_entries_examined=" << file.elf->symbol_entries_examined
+                << " symbol_records_omitted=" << file.elf->symbol_records_omitted
+                << " relocations_examined=" << file.elf->relocation_entries_examined << '/'
+                << file.elf->relocation_table_entries;
         }
         out << '\n';
     }

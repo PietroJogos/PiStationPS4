@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "firmware900_parser_budget.h"
 
 namespace PiStation {
 
@@ -61,6 +62,11 @@ struct ElfMetadata {
     std::string relocation_status = "not_present";
     bool tls_present{};
     std::uint64_t symbol_table_entries{};
+    std::uint64_t symbol_entries_examined{};
+    std::uint64_t symbol_records_omitted{};
+    std::uint64_t relocation_table_entries{};
+    std::uint64_t relocation_entries_examined{};
+    bool segments_validated{};
 };
 
 struct SelfMetadata {
@@ -196,6 +202,8 @@ struct ScanReport {
     std::vector<Diagnostic> diagnostics;
     std::size_t error_count{};
     std::vector<std::string> vfs_accesses;
+    ParserBudget parser_budget_initial;
+    ParserBudget parser_budget_remaining;
     DependencyAnalysis analysis;
     ServiceAnalysis services;
     BootDiagnostic boot;
@@ -205,7 +213,8 @@ using HleLookup = std::function<bool(const SymbolMetadata&)>;
 
 class Firmware900Manager {
 public:
-    ScanReport Scan(const std::filesystem::path& directory, std::size_t max_entries = 10000) const;
+    ScanReport Scan(const std::filesystem::path& directory, std::size_t max_entries = 10000,
+                    ParserBudget parser_budget = {}) const;
     static void DiagnoseServices(ScanReport& report, const HleLookup& registered_hle = {});
     static void WriteReport(const ScanReport& report, const std::filesystem::path& output);
     static void WriteTextReport(const ScanReport& report, const std::filesystem::path& output);

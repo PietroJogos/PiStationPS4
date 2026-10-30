@@ -15,6 +15,7 @@ public:
     std::string stage;
 };
 
-void AnalyzeElfMetadata(const ReadOnlyFirmwareVfs::File& input, FileRecord& file);
+void AnalyzeElfMetadata(const ReadOnlyFirmwareVfs::File& input, FileRecord& file,
+                        ParserBudget& budget);
 
 } // namespace PiStation

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "elf_metadata_parser.h"
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <set>
@@ -36,6 +37,25 @@ std::vector<unsigned char> Read(const Input& input, std::uint64_t offset, std::u
     return input.Read(offset, size);
 }
 
+void Consume(std::size_t& remaining, std::size_t amount, const char* stage, const char* label) {
+    if (amount > remaining) {
+        throw MetadataIssue("diagnostic_limit_exceeded", stage,
+                            std::string(label) + " scan budget exhausted; analysis incomplete");
+    }
+    remaining -= amount;
+}
+
+void KeepStructure(ParserBudget& budget, std::size_t bytes) {
+    Consume(budget.structure_bytes, bytes, "structure", "essential metadata bytes");
+}
+
+void CountRelocation(ElfMetadata& elf, std::uint32_t type, ParserBudget& budget) {
+    if (!elf.relocation_types.contains(type)) {
+        KeepStructure(budget, 96);
+    }
+    ++elf.relocation_types[type];
+}
+
 std::string EncodeId(std::uint16_t id) {
     constexpr std::string_view alphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
@@ -48,81 +68,113 @@ std::string EncodeId(std::uint16_t id) {
 }
 
 void Symbols(const Input& input, FileRecord& file, std::uint64_t offset, std::uint64_t count,
-             std::uint64_t entry_size, const std::vector<unsigned char>& names, bool sce) {
+             std::uint64_t entry_size, const std::vector<unsigned char>& names, bool sce,
+             ParserBudget& budget) {
     file.elf->symbol_table_entries = count;
     if (entry_size != sizeof(elf_symbol)) {
         throw MetadataIssue("unsupported_metadata", "symbols",
                             "unsupported symbol entry size=" + std::to_string(entry_size));
     }
-    if (count > MaxEntries) {
+    if (count > ParserBudget::MaxFileSymbols - file.elf->symbol_entries_examined) {
         throw MetadataIssue("diagnostic_limit_exceeded", "symbols",
-                            "symbol count=" + std::to_string(count) +
-                                " exceeds diagnostic limit=4096; validity not determined");
+                            "symbol table exceeds per-file work limit=" +
+                                std::to_string(ParserBudget::MaxFileSymbols));
     }
-    const auto data = Read(input, offset, count * sizeof(elf_symbol));
-    file.elf->symbol_table_entries = count;
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto base = i * sizeof(elf_symbol);
-        const auto binding = static_cast<unsigned>(data[base + 4]) >> 4;
-        const auto visibility = static_cast<unsigned>(data[base + 5]) & 3U;
-        const auto section = ReadLe(data, base + 6, 2);
-        const bool imported = sce ? ReadLe(data, base + 8, 8) == 0 : section == 0;
-        const auto name = ReadString(names, ReadLe(data, base, 4));
-        if (name.empty() || (binding != STB_GLOBAL && binding != STB_WEAK) ||
-            (!imported && visibility != STV_DEFAULT && visibility != STV_PROTECTED)) {
-            continue;
+    using Imported = std::map<std::string, const Dependency*>;
+    using Exported = std::map<std::string, const ModuleIdentity*>;
+    Imported import_libraries, import_modules;
+    Exported export_libraries, export_modules;
+    for (const auto& item : file.dependencies) {
+        if (item.kind == "DT_SCE_IMPORT_LIB") {
+            import_libraries.emplace(EncodeId(item.id), &item);
         }
-        if (section == 0xffff) {
-            throw MetadataIssue("unsupported_metadata", "symbols",
-                                "extended symbol section indexes are unsupported");
+        if (item.kind == "DT_SCE_NEEDED_MODULE") {
+            import_modules.emplace(EncodeId(item.id), &item);
         }
-        SymbolMetadata symbol;
-        symbol.name = name;
-        symbol.type = data[base + 4] & 15;
-        symbol.weak = binding == STB_WEAK;
-        symbol.imported = imported;
-        if (sce) {
-            const auto first = name.find('#');
-            const auto second = first == std::string::npos ? first : name.find('#', first + 1);
-            if (first != std::string::npos && second != std::string::npos &&
-                name.find('#', second + 1) == std::string::npos) {
-                const auto lib_id = name.substr(first + 1, second - first - 1);
-                const auto mod_id = name.substr(second + 1);
-                if (imported) {
-                    for (const auto& dep : file.dependencies) {
-                        if (dep.kind == "DT_SCE_IMPORT_LIB" && EncodeId(dep.id) == lib_id) {
-                            symbol.library = dep.name;
-                            symbol.library_version = dep.version;
+    }
+    for (const auto& item : file.exported_libraries) {
+        export_libraries.emplace(EncodeId(item.id), &item);
+    }
+    for (const auto& item : file.exported_modules) {
+        export_modules.emplace(EncodeId(item.id), &item);
+    }
+    for (std::uint64_t first = 0; first < count;) {
+        const auto chunk = std::min<std::uint64_t>(ParserBudget::ChunkEntries, count - first);
+        Consume(budget.symbol_entries, static_cast<std::size_t>(chunk), "symbols",
+                "symbol entries");
+        const auto data = Read(input, offset + first * entry_size, chunk * entry_size);
+        for (std::size_t i = 0; i < chunk; ++i) {
+            const auto base = i * sizeof(elf_symbol);
+            ++file.elf->symbol_entries_examined;
+            const auto binding = static_cast<unsigned>(data[base + 4]) >> 4;
+            const auto visibility = static_cast<unsigned>(data[base + 5]) & 3U;
+            const auto section = ReadLe(data, base + 6, 2);
+            const bool imported = sce ? ReadLe(data, base + 8, 8) == 0 : section == 0;
+            const auto name = ReadString(names, ReadLe(data, base, 4));
+            if (name.empty() || (binding != STB_GLOBAL && binding != STB_WEAK) ||
+                (!imported && visibility != STV_DEFAULT && visibility != STV_PROTECTED)) {
+                continue;
+            }
+            if (section == 0xffff) {
+                throw MetadataIssue("unsupported_metadata", "symbols",
+                                    "extended symbol section indexes are unsupported");
+            }
+            SymbolMetadata symbol;
+            symbol.name = name;
+            symbol.type = data[base + 4] & 15;
+            symbol.weak = binding == STB_WEAK;
+            symbol.imported = imported;
+            if (sce) {
+                const auto first = name.find('#');
+                const auto second = first == std::string::npos ? first : name.find('#', first + 1);
+                if (first != std::string::npos && second != std::string::npos &&
+                    name.find('#', second + 1) == std::string::npos) {
+                    const auto lib_id = name.substr(first + 1, second - first - 1);
+                    const auto mod_id = name.substr(second + 1);
+                    if (imported) {
+                        if (const auto found = import_libraries.find(lib_id);
+                            found != import_libraries.end()) {
+                            symbol.library = found->second->name;
+                            symbol.library_version = found->second->version;
                         }
-                        if (dep.kind == "DT_SCE_NEEDED_MODULE" && EncodeId(dep.id) == mod_id) {
-                            symbol.module = dep.name;
+                        if (const auto found = import_modules.find(mod_id);
+                            found != import_modules.end()) {
+                            symbol.module = found->second->name;
+                        }
+                    } else {
+                        if (const auto found = export_libraries.find(lib_id);
+                            found != export_libraries.end()) {
+                            symbol.library = found->second->name;
+                            symbol.library_version = found->second->version;
+                        }
+                        if (const auto found = export_modules.find(mod_id);
+                            found != export_modules.end()) {
+                            symbol.module = found->second->name;
                         }
                     }
-                } else {
-                    for (const auto& lib : file.exported_libraries) {
-                        if (EncodeId(lib.id) == lib_id) {
-                            symbol.library = lib.name;
-                            symbol.library_version = lib.version;
-                        }
+                    if (!symbol.library.empty() && !symbol.module.empty() && first > 0) {
+                        symbol.qualified = true;
+                        symbol.name = name.substr(0, first);
                     }
-                    for (const auto& mod : file.exported_modules) {
-                        if (EncodeId(mod.id) == mod_id) {
-                            symbol.module = mod.name;
-                        }
-                    }
-                }
-                if (!symbol.library.empty() && !symbol.module.empty() && first > 0) {
-                    symbol.qualified = true;
-                    symbol.name = name.substr(0, first);
                 }
             }
+            const auto charge = 2 * sizeof(SymbolMetadata) + 96 + symbol.name.size() +
+                                symbol.library.size() + symbol.module.size();
+            if (charge > budget.symbol_bytes) {
+                ++file.elf->symbol_records_omitted;
+            } else {
+                budget.symbol_bytes -= charge;
+                file.symbols.push_back(std::move(symbol));
+            }
         }
-        file.symbols.push_back(std::move(symbol));
+        first += chunk;
     }
-    file.symbol_status = "parsed_dynamic_symbols";
+    file.symbol_status =
+        file.elf->symbol_records_omitted ? "incomplete_metadata_limit" : "parsed_dynamic_symbols";
 }
 
-void Sections(const Input& input, FileRecord& file, const std::vector<unsigned char>& header) {
+void Sections(const Input& input, FileRecord& file, const std::vector<unsigned char>& header,
+              ParserBudget& budget) {
     const auto count = ReadLe(header, 60, 2);
     if (count == 0) {
         if (ReadLe(header, 40, 8) != 0) {
@@ -151,7 +203,8 @@ void Sections(const Input& input, FileRecord& file, const std::vector<unsigned c
         if (type != 8 && size && !InRange(start, size, file.size)) {
             throw std::runtime_error("section range exceeds file");
         }
-        if (type != 11 || file.symbol_status == "parsed_dynamic_symbols") {
+        if (type != 11 || (file.symbol_status == "parsed_dynamic_symbols" ||
+                           file.symbol_status == "incomplete_metadata_limit")) {
             continue;
         }
         const auto link = ReadLe(sections, base + 40, 4);
@@ -169,13 +222,13 @@ void Sections(const Input& input, FileRecord& file, const std::vector<unsigned c
         }
         const auto names = Read(input, ReadLe(sections, strings_base + 24, 8),
                                 ReadLe(sections, strings_base + 32, 8));
-        Symbols(input, file, start, size / entry_size, entry_size, names, false);
+        Symbols(input, file, start, size / entry_size, entry_size, names, false, budget);
     }
 }
 
 } // namespace
 
-void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
+void AnalyzeElfMetadata(const Input& input, FileRecord& file, ParserBudget& budget) {
     const auto ident = Read(input, 0, 16);
     if ((ident[4] != 1 && ident[4] != 2) || (ident[5] != 1 && ident[5] != 2) || ident[6] != 1) {
         throw std::runtime_error("invalid ELF identification fields");
@@ -244,8 +297,10 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
             }
             target = s;
         }
+        KeepStructure(budget, sizeof(SegmentMetadata));
         elf.segments.push_back(s);
     }
+    elf.segments_validated = true;
     file.status = "metadata_validated";
     file.symbol_status = "not_present";
     file.dependency_status = dynamic ? "declared_names_only" : "no_dynamic_table";
@@ -253,7 +308,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
         file.notes.emplace_back("Entry point is not covered by an executable PT_LOAD segment.");
     }
     if (!dynamic) {
-        Sections(input, file, header);
+        Sections(input, file, header, budget);
         return;
     }
     if (!dynamic->file_size || dynamic->file_size % sizeof(elf_dynamic)) {
@@ -370,6 +425,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
             d.version &= 255;
             d.minor_version = static_cast<std::uint16_t>((value >> 32) & 255);
         }
+        KeepStructure(budget, 2 * sizeof(Dependency) + d.name.size() + d.kind.size() + 64);
         file.dependencies.push_back(std::move(d));
     }
     for (const auto& [tag, value] : identities) {
@@ -377,6 +433,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
         identity.name = name_at(value & 0xffffffffULL);
         identity.id = static_cast<std::uint16_t>(value >> 48);
         identity.version = static_cast<std::uint16_t>((value >> 32) & 0xffff);
+        KeepStructure(budget, 2 * sizeof(ModuleIdentity) + 2 * identity.name.size() + 64);
         if (tag == DT_SCE_MODULE_INFO) {
             identity.version = static_cast<std::uint16_t>((value >> 40) & 255);
             identity.minor_version = static_cast<std::uint16_t>((value >> 32) & 255);
@@ -403,7 +460,9 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
         }
     }
     if (tags.contains(14) && !file.module_identity) {
-        file.module_identity = ModuleIdentity{name_at(tags.at(14))};
+        auto name = name_at(tags.at(14));
+        KeepStructure(budget, 2 * sizeof(ModuleIdentity) + name.size() + 32);
+        file.module_identity = ModuleIdentity{std::move(name)};
     }
     if (tags.contains(DT_SCE_SYMTAB) && tags.contains(DT_SCE_SYMTABSZ)) {
         const auto size = tags.at(DT_SCE_SYMTABSZ);
@@ -416,7 +475,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
             throw std::runtime_error("SCE symbol table byte size is not a multiple of entry size");
         }
         Symbols(input, file, sce_offset(tags.at(DT_SCE_SYMTAB), size), size / entry_size,
-                entry_size, names, true);
+                entry_size, names, true, budget);
     } else if (tags.contains(6) && tags.contains(4)) {
         const auto hash = Read(input, locate(tags.at(4), 8), 8);
         const auto buckets = ReadLe(hash, 0, 4);
@@ -427,12 +486,12 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
                                 "unsupported ELF symbol entry size=" + std::to_string(entry_size));
         }
         locate(tags.at(4), 8 + 4 * (buckets + count));
-        if (buckets > MaxEntries) {
+        if (buckets > ParserBudget::MaxFileSymbols) {
             throw MetadataIssue("diagnostic_limit_exceeded", "symbols",
-                                "ELF hash bucket count exceeds diagnostic limit=4096");
+                                "ELF hash bucket count exceeds diagnostic limit=131072");
         }
         Symbols(input, file, locate(tags.at(6), count * entry_size), count, entry_size, names,
-                false);
+                false, budget);
     } else if (tags.contains(6)) {
         file.symbol_status = "count_unavailable";
     }
@@ -455,76 +514,88 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
                 "relocation byte size is not a multiple of ELF64 RELA entry size");
         }
         const auto table_offset = sce ? sce_offset(tags.at(ptr), size) : locate(tags.at(ptr), size);
-        if (size / sizeof(elf_relocation) > MaxEntries) {
-            throw MetadataIssue(
-                "diagnostic_limit_exceeded", "relocations",
-                "relocation count=" + std::to_string(size / sizeof(elf_relocation)) +
-                    " exceeds diagnostic limit=4096; tag=" + std::to_string(ptr) +
-                    "; validity not determined");
+        const auto count = size / sizeof(elf_relocation);
+        elf.relocation_table_entries += count;
+        if (count > ParserBudget::MaxFileRelocations - elf.relocation_entries_examined) {
+            throw MetadataIssue("diagnostic_limit_exceeded", "relocations",
+                                "relocation table exceeds per-file work limit=" +
+                                    std::to_string(ParserBudget::MaxFileRelocations));
         }
-        const auto data = Read(input, table_offset, size);
-        for (std::size_t b = 0; b < data.size(); b += sizeof(elf_relocation)) {
-            const auto address = ReadLe(data, b, 8);
-            const auto info = ReadLe(data, b + 8, 8);
-            const auto type = static_cast<std::uint32_t>(info);
-            if (type == 0) {
-                ++elf.relocation_types[type];
-                continue;
+        for (std::uint64_t first = 0; first < count;) {
+            const auto chunk = std::min<std::uint64_t>(ParserBudget::ChunkEntries, count - first);
+            Consume(budget.relocation_entries, static_cast<std::size_t>(chunk), "relocations",
+                    "relocation entries");
+            Consume(budget.validation_steps,
+                    static_cast<std::size_t>(chunk) * std::max<std::size_t>(1, elf.segments.size()),
+                    "relocations", "segment validation steps");
+            const auto data = Read(input, table_offset + first * sizeof(elf_relocation),
+                                   chunk * sizeof(elf_relocation));
+            for (std::size_t b = 0; b < data.size(); b += sizeof(elf_relocation)) {
+                ++elf.relocation_entries_examined;
+                const auto address = ReadLe(data, b, 8);
+                const auto info = ReadLe(data, b + 8, 8);
+                const auto type = static_cast<std::uint32_t>(info);
+                if (type == 0) {
+                    CountRelocation(elf, type, budget);
+                    continue;
+                }
+                std::uint64_t width{};
+                switch (type) {
+                case 1:
+                case 6:
+                case 7:
+                case 8:
+                case 16:
+                case 17:
+                case 18:
+                case 24:
+                    width = 8;
+                    break;
+                case 2:
+                case 4:
+                case 9:
+                case 10:
+                case 11:
+                    width = 4;
+                    break;
+                case 12:
+                case 13:
+                    width = 2;
+                    break;
+                case 14:
+                case 15:
+                    width = 1;
+                    break;
+                case 36:
+                    width = 16;
+                    break;
+                default:
+                    CountRelocation(elf, type, budget);
+                    throw MetadataIssue(
+                        "unsupported_metadata", "relocations",
+                        "relocation write width unsupported; type=" + std::to_string(type) +
+                            "; r_offset=" + std::to_string(address));
+                }
+                if ((info >> 32) && file.elf->symbol_table_entries &&
+                    (info >> 32) >= file.elf->symbol_table_entries) {
+                    throw std::runtime_error("relocation symbol index outside symbol table");
+                }
+                bool mapped{};
+                for (const auto& segment : elf.segments) {
+                    mapped |= LoadSegment(segment.type) && address >= segment.address &&
+                              InRange(address - segment.address, width, segment.memory_size);
+                }
+                if (!mapped) {
+                    throw std::runtime_error(
+                        "relocation destination is outside PT_LOAD/PT_SCE_RELRO; tag=" +
+                        std::to_string(ptr) +
+                        "; index=" + std::to_string(first + b / sizeof(elf_relocation)) +
+                        "; type=" + std::to_string(type) + "; r_offset=" + std::to_string(address) +
+                        "; width=" + std::to_string(width));
+                }
+                CountRelocation(elf, type, budget);
             }
-            std::uint64_t width{};
-            switch (type) {
-            case 1:
-            case 6:
-            case 7:
-            case 8:
-            case 16:
-            case 17:
-            case 18:
-            case 24:
-                width = 8;
-                break;
-            case 2:
-            case 4:
-            case 9:
-            case 10:
-            case 11:
-                width = 4;
-                break;
-            case 12:
-            case 13:
-                width = 2;
-                break;
-            case 14:
-            case 15:
-                width = 1;
-                break;
-            case 36:
-                width = 16;
-                break;
-            default:
-                ++elf.relocation_types[type];
-                throw MetadataIssue(
-                    "unsupported_metadata", "relocations",
-                    "relocation write width unsupported; type=" + std::to_string(type) +
-                        "; r_offset=" + std::to_string(address));
-            }
-            if ((info >> 32) && file.elf->symbol_table_entries &&
-                (info >> 32) >= file.elf->symbol_table_entries) {
-                throw std::runtime_error("relocation symbol index outside symbol table");
-            }
-            bool mapped{};
-            for (const auto& segment : elf.segments) {
-                mapped |= LoadSegment(segment.type) && address >= segment.address &&
-                          InRange(address - segment.address, width, segment.memory_size);
-            }
-            if (!mapped) {
-                throw std::runtime_error(
-                    "relocation destination is outside PT_LOAD/PT_SCE_RELRO; tag=" +
-                    std::to_string(ptr) + "; index=" + std::to_string(b / sizeof(elf_relocation)) +
-                    "; type=" + std::to_string(type) + "; r_offset=" + std::to_string(address) +
-                    "; width=" + std::to_string(width));
-            }
-            ++elf.relocation_types[type];
+            first += chunk;
         }
         elf.relocation_status = "metadata_only_not_applied";
     };
@@ -532,7 +603,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
     relocations(DT_SCE_JMPREL, DT_SCE_PLTRELSZ, DT_SCE_PLTREL, true, true);
     relocations(7, 8, 9, false, false);
     relocations(23, 2, 20, false, true);
-    Sections(input, file, header);
+    Sections(input, file, header, budget);
 }
 
 } // namespace PiStation
