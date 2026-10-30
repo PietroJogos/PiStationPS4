@@ -92,6 +92,17 @@ void Inspect(ScanReport& report, const ReadOnlyFirmwareVfs& vfs,
     } else if (filename.find("sceshellcore") != std::string::npos) {
         file.shell_role = "SceShellCore_name_candidate";
     }
+    if (file.shell_role.empty() && (filename == "eboot.bin" || filename == "eboot.elf")) {
+        for (const auto& component : relative.parent_path()) {
+            const auto name = Lower(Firmware900Manager::PathText(component));
+            if (name == "npxs20001" || name == "sceshellui") {
+                file.shell_role = "SceShellUI_path_candidate_unverified";
+                file.notes.emplace_back("Path suggests a ShellUI component; executable identity "
+                                        "and firmware version are not verified.");
+                break;
+            }
+        }
+    }
     try {
         file.size = size;
         auto reader = vfs.OpenRelative(file.path);
@@ -120,6 +131,21 @@ void Inspect(ScanReport& report, const ReadOnlyFirmwareVfs& vfs,
                 file.notes.emplace_back("The filename extension does not match ELF or SELF magic.");
             }
         }
+    } catch (const MetadataIssue& error) {
+        file.status = error.kind;
+        file.dependency_status = "incomplete";
+        if (error.stage == "symbols") {
+            file.symbol_status = error.kind;
+        }
+        if (file.elf && error.stage == "relocations") {
+            file.elf->relocation_status = error.kind;
+        }
+        report.complete = false;
+        file.notes.emplace_back(error.what());
+        Log(report, "ERROR", quoted + ": " + error.what());
+        report.diagnostics.back().related = Firmware900Manager::PathText(file.path);
+        report.diagnostics.back().operation = "ELF_" + error.stage;
+        report.diagnostics.back().result = error.kind;
     } catch (const std::exception& error) {
         file.status = "invalid_or_unreadable";
         file.dependency_status = "incomplete";

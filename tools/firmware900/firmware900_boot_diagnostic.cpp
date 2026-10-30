@@ -30,7 +30,7 @@ void InspectMemory(const ElfMetadata& elf, BootImagePlan& image) {
         if (segment.type == PT_TLS) {
             image.tls_bytes = std::max(image.tls_bytes, segment.memory_size);
         }
-        if (segment.type != PT_LOAD) {
+        if (segment.type != PT_LOAD && segment.type != PT_SCE_RELRO) {
             continue;
         }
         ++image.load_segments;
@@ -126,6 +126,10 @@ void Firmware900BootDiagnostic::Analyze(ScanReport& report) const {
         image.process_candidate = !file.shell_role.empty();
         image.blockers = {"runtime_execution_disabled", "module_initialization_not_attempted"};
         if (file.status != "metadata_validated" || !file.elf) {
+            if (file.status == "diagnostic_limit_exceeded" ||
+                file.status == "unsupported_metadata") {
+                Block(image.blockers, "parser_" + file.status);
+            }
             Block(image.blockers, file.self ? "self_payload_unavailable_for_analysis"
                                             : "executable_metadata_invalid_or_unavailable");
         } else {
