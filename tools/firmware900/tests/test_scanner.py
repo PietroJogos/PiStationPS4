@@ -618,6 +618,15 @@ class ScannerTests(unittest.TestCase):
         self.write('normal', b'data')
         self.scan(1, extra=('--vfs-path', '/' + 'x' * 4096))
 
+    def test_phase4_explicit_boot_request_fails_closed(self):
+        self.write('SceShellUI.synthetic.elf', analyzed_elf())
+        result, report = self.scan(1, extra=('--attempt-boot',))
+        self.assertFalse(report['boot_attempted'])
+        self.assertEqual(report['boot_diagnostic']['state'],
+                         'experimental_boot_blocked_before_execution')
+        self.assertEqual(report['diagnostics'][-1]['result'], 'boot_backend_unavailable')
+        self.assertIn('[PS4_BOOT]', result.stdout)
+
     def service_input(self, nid, library, module):
         self.write('SceShellCore.synthetic.elf', analyzed_elf(
             sce=True, module='syntheticShell', exported_library=None,

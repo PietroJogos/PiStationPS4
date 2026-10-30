@@ -20,6 +20,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> probes;
         std::size_t max_entries = 10000;
         bool boot_diagnostic{};
+        bool attempt_boot{};
         for (int i = 1; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--help" && argc == 2) {
@@ -28,13 +29,18 @@ int main(int argc, char* argv[]) {
                        "Usage: pistation-firmware900 --firmware-dir PATH --report NEW_JSON "
                        "[--text-report NEW_TEXT] [--max-entries N] "
                        "[--mount /guest=relative_host] [--vfs-path /guest/file] "
-                       "[--boot-diagnostic]\n"
+                       "[--boot-diagnostic] [--attempt-boot]\n"
                        "--boot-diagnostic: PS4 Firmware 9.00 Boot Diagnostic (static plan only).\n"
                        "The report must be outside PATH. No firmware version verification, "
                        "decryption, loading or execution is performed.\n"
                        "Exit codes: 0 scan without errors; 1 scan errors/incomplete; "
                        "2 arguments or output failure.\n";
                 return 0;
+            }
+            if (option == "--attempt-boot" && !attempt_boot) {
+                attempt_boot = true;
+                boot_diagnostic = true;
+                continue;
             }
             if (option == "--boot-diagnostic" && !boot_diagnostic) {
                 boot_diagnostic = true;
@@ -106,6 +112,22 @@ int main(int argc, char* argv[]) {
         Firmware900Manager::DiagnoseServices(report);
         if (boot_diagnostic) {
             PiStation::Firmware900BootDiagnostic{}.Analyze(report);
+        }
+        if (attempt_boot) {
+            report.boot.state = "experimental_boot_blocked_before_execution";
+            ++report.error_count;
+            report.diagnostics.push_back({"PS4_BOOT",
+                                          "PS4 Firmware 9.00 Experimental Boot",
+                                          "request_boot",
+                                          {},
+                                          "explicit_request_received_no_guest_execution"});
+            report.diagnostics.push_back(
+                {"ERROR",
+                 "Native emulator execution backend is not linked into this offline tool; "
+                 "full emulator build is required before preparing guest memory or calling Linker",
+                 "prepare_native_execution_backend",
+                 {},
+                 "boot_backend_unavailable"});
         }
         Firmware900Manager::Emit(report, [&](const PiStation::Diagnostic& diagnostic) {
             std::cout << '[' << diagnostic.category << "] "
