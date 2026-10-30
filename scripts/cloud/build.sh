@@ -5,7 +5,12 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$script_dir/env.sh"
 source "$script_dir/upstream.env"
 source_dir="${PISTATION_SOURCE_DIR:-$PISTATION_ENV_DIR/source/shadPS4}"
-build_dir="${PISTATION_BUILD_DIR:-$PISTATION_ENV_DIR/build/baseline}"
+build_type="${PISTATION_BUILD_TYPE:-Debug}"
+case "$build_type" in
+    Debug|Release|RelWithDebInfo|MinSizeRel) ;;
+    *) echo 'PISTATION_BUILD_TYPE inválido.' >&2; exit 1 ;;
+esac
+build_dir="${PISTATION_BUILD_DIR:-$PISTATION_ENV_DIR/build/baseline-$build_type}"
 jobs="${PISTATION_JOBS:-2}"
 mkdir -p "$PISTATION_ENV_DIR/logs"
 export XDG_DATA_HOME="$PISTATION_ENV_DIR/state/data"
@@ -32,7 +37,7 @@ cmake -S "$source_dir" -B "$build_dir" -G Ninja \
     -DCMAKE_SYSROOT="$PISTATION_PREFIX" \
     "-DCMAKE_C_FLAGS=--gcc-toolchain=$PISTATION_PREFIX/usr" \
     "-DCMAKE_CXX_FLAGS=--gcc-toolchain=$PISTATION_PREFIX/usr" \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DCMAKE_BUILD_TYPE="$build_type" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DENABLE_SYSTEM_LIBRARIES=OFF -DENABLE_TESTS=OFF \
     2>&1 | tee "$PISTATION_ENV_DIR/logs/configure.log"
 cmake --build "$build_dir" --parallel "$jobs" \
