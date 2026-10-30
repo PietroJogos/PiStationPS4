@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "core/loader/elf_types.h"
+#include "elf_metadata_parser.h"
+#include "firmware900_binary.h"
 #include "firmware900_manager.h"
+#include "read_only_firmware_vfs.h"
 
 #include <algorithm>
 #include <array>
@@ -15,9 +19,7 @@
 namespace PiStation {
 namespace {
 
-constexpr std::uint64_t MaxMetadata = 4 * 1024 * 1024;
 constexpr std::uint64_t MaxHeaders = 4096;
-constexpr std::uint64_t MaxDependencies = 4096;
 constexpr std::size_t MaxTotalDependencies = 8192;
 constexpr std::size_t MaxTotalCandidates = 8192;
 
@@ -30,199 +32,10 @@ std::string Lower(std::string value) {
     return value;
 }
 
-bool InRange(std::uint64_t offset, std::uint64_t count, std::uint64_t size) {
-    return offset <= size && count <= size - offset;
-}
-
-std::uint64_t ReadLe(const std::vector<unsigned char>& data, std::size_t offset,
-                     std::size_t width) {
-    if (!InRange(offset, width, data.size()) || width > 8) {
-        throw std::runtime_error("truncated metadata field");
-    }
-    std::uint64_t value{};
-    for (std::size_t i = 0; i < width; ++i) {
-        value |= std::uint64_t{data[offset + i]} << (8 * i);
-    }
-    return value;
-}
-
-class Reader {
-public:
-    Reader(const std::filesystem::path& path, std::uint64_t size)
-        : stream{path, std::ios::binary}, size{size} {
-        if (!stream) {
-            throw std::runtime_error("cannot open file for reading");
-        }
-    }
-
-    std::vector<unsigned char> Read(std::uint64_t offset, std::uint64_t count) {
-        if (count > MaxMetadata || !InRange(offset, count, size) ||
-            offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
-            throw std::runtime_error("metadata range invalid or diagnostic limit exceeded");
-        }
-        std::vector<unsigned char> bytes(static_cast<std::size_t>(count));
-        stream.clear();
-        stream.seekg(static_cast<std::streamoff>(offset));
-        if (count != 0) {
-            stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(count));
-        }
-        if (!stream || static_cast<std::uint64_t>(stream.gcount()) != count) {
-            if (count != 0 || !stream) {
-                throw std::runtime_error("metadata read failed; file may have changed");
-            }
-        }
-        return bytes;
-    }
-
-private:
-    std::ifstream stream;
-    std::uint64_t size;
-};
-
-struct Segment {
-    std::uint64_t type{};
-    std::uint64_t offset{};
-    std::uint64_t address{};
-    std::uint64_t size{};
-};
-
-void ParseElf(Reader& reader, FileRecord& file) {
-    const auto ident = reader.Read(0, 16);
-    if ((ident[4] != 1 && ident[4] != 2) || (ident[5] != 1 && ident[5] != 2) || ident[6] != 1) {
-        throw std::runtime_error("invalid ELF identification fields");
-    }
-    if (ident[4] != 2 || ident[5] != 1) {
-        file.status = "unsupported";
-        file.notes.emplace_back("Only ELF64 little-endian metadata is supported.");
-        return;
-    }
-    const auto header = reader.Read(0, 64);
-    if (header[6] != 1 || ReadLe(header, 20, 4) != 1 || ReadLe(header, 52, 2) != 64) {
-        throw std::runtime_error("invalid ELF version or ELF64 header size");
-    }
-    file.elf = ElfMetadata{static_cast<std::uint16_t>(ReadLe(header, 16, 2)),
-                           static_cast<std::uint16_t>(ReadLe(header, 18, 2)), ReadLe(header, 24, 8),
-                           static_cast<std::uint16_t>(ReadLe(header, 56, 2))};
-    if (file.elf->machine != 62) {
-        file.status = "unsupported";
-        file.notes.emplace_back("ELF machine is not x86-64.");
-        return;
-    }
-    const auto phoff = ReadLe(header, 32, 8);
-    const auto phsize = ReadLe(header, 54, 2);
-    const auto phcount = file.elf->program_headers;
-    if (phcount > MaxHeaders || (phcount && (phsize != 56 || phoff < 64))) {
-        throw std::runtime_error("invalid or unsupported ELF program header table");
-    }
-    const auto table = reader.Read(phcount ? phoff : 0, phcount * 56ULL);
-    std::vector<Segment> segments;
-    std::optional<Segment> dynamic;
-    std::optional<Segment> sce_data;
-    for (std::size_t i = 0; i < phcount; ++i) {
-        const auto base = i * 56;
-        Segment segment{ReadLe(table, base, 4), ReadLe(table, base + 8, 8),
-                        ReadLe(table, base + 16, 8), ReadLe(table, base + 32, 8)};
-        if (segment.size && !InRange(segment.offset, segment.size, file.size)) {
-            throw std::runtime_error("ELF segment extends beyond the file");
-        }
-        if (segment.type == 1 && ReadLe(table, base + 40, 8) < segment.size) {
-            throw std::runtime_error("ELF PT_LOAD memory size is smaller than file size");
-        }
-        if (segment.type == 2) {
-            if (dynamic) {
-                throw std::runtime_error("ambiguous multiple PT_DYNAMIC segments");
-            }
-            dynamic = segment;
-        }
-        if (segment.type == 0x61000000) {
-            if (sce_data) {
-                throw std::runtime_error("ambiguous multiple PT_SCE_DYNLIBDATA segments");
-            }
-            sce_data = segment;
-        }
-        segments.push_back(segment);
-    }
-    file.status = "metadata_validated";
-    file.notes.emplace_back("Metadata checks do not establish executability or firmware version.");
-    if (!dynamic) {
-        file.dependency_status = "no_dynamic_table";
-        return;
-    }
-    if (dynamic->size == 0 || dynamic->size % 16 != 0) {
-        throw std::runtime_error("invalid ELF dynamic table size");
-    }
-    const auto entries = reader.Read(dynamic->offset, dynamic->size);
-    std::map<std::uint64_t, std::uint64_t> strings;
-    std::vector<std::pair<std::string, std::uint64_t>> needed;
-    bool terminated = false;
-    for (std::size_t offset = 0; offset < entries.size(); offset += 16) {
-        const auto tag = ReadLe(entries, offset, 8);
-        const auto value = ReadLe(entries, offset + 8, 8);
-        if (tag == 0) {
-            terminated = true;
-            break;
-        }
-        if (tag == 1 || tag == 0x6100000f || tag == 0x61000015) {
-            if (needed.size() >= MaxDependencies) {
-                throw std::runtime_error("dependency count exceeds diagnostic limit");
-            }
-            const auto kind = tag == 1            ? "DT_NEEDED"
-                              : tag == 0x6100000f ? "DT_SCE_NEEDED_MODULE"
-                                                  : "DT_SCE_IMPORT_LIB";
-            needed.emplace_back(kind, tag == 1 ? value : value & 0xffffffffULL);
-        } else if (tag == 5 || tag == 10 || tag == 0x61000035 || tag == 0x61000037) {
-            const auto [it, added] = strings.emplace(tag, value);
-            if (!added && it->second != value) {
-                throw std::runtime_error("conflicting ELF string table metadata");
-            }
-        }
-    }
-    if (!terminated) {
-        throw std::runtime_error("ELF dynamic table has no DT_NULL terminator");
-    }
-    file.dependency_status = "declared_names_only";
-    if (needed.empty()) {
-        return;
-    }
-    std::uint64_t string_offset{};
-    std::uint64_t string_size{};
-    if (strings.contains(0x61000035) && strings.contains(0x61000037)) {
-        if (!sce_data || !InRange(strings.at(0x61000035), strings.at(0x61000037), sce_data->size)) {
-            throw std::runtime_error("SCE string table outside PT_SCE_DYNLIBDATA");
-        }
-        string_offset = sce_data->offset + strings.at(0x61000035);
-        string_size = strings.at(0x61000037);
-    } else if (strings.contains(5) && strings.contains(10)) {
-        const auto address = strings.at(5);
-        string_size = strings.at(10);
-        std::size_t matches{};
-        for (const auto& segment : segments) {
-            if (segment.type == 1 && address >= segment.address &&
-                InRange(address - segment.address, string_size, segment.size)) {
-                string_offset = segment.offset + (address - segment.address);
-                ++matches;
-            }
-        }
-        if (matches != 1) {
-            throw std::runtime_error("ELF string table has no unambiguous file-backed PT_LOAD");
-        }
-    } else {
-        throw std::runtime_error("dependency declarations lack a supported string table");
-    }
-    const auto names = reader.Read(string_offset, string_size);
-    for (const auto& [kind, offset] : needed) {
-        if (offset >= names.size()) {
-            throw std::runtime_error("dependency name offset is outside string table");
-        }
-        const auto begin = names.begin() + static_cast<std::ptrdiff_t>(offset);
-        const auto end = std::find(begin, names.end(), 0);
-        if (end == names.end() || end == begin || end - begin > 1024) {
-            throw std::runtime_error(
-                "dependency name is empty, unterminated or exceeds 1024 bytes");
-        }
-        file.dependencies.push_back({kind, std::string(begin, end), {}});
-    }
-}
+using Binary::InRange;
+using Binary::ReadLe;
+using Reader = ReadOnlyFirmwareVfs::File;
+std::string PublicError(const std::exception& error);
 
 void ParseSelf(Reader& reader, FileRecord& file) {
     const auto header = reader.Read(0, 32);
@@ -259,13 +72,16 @@ void Log(ScanReport& report, std::string category, std::string message) {
     if (category == "ERROR") {
         ++report.error_count;
     }
-    report.diagnostics.push_back({std::move(category), std::move(message)});
+    const auto result = category == "ERROR" ? "failed" : "observed";
+    report.diagnostics.push_back(
+        {std::move(category), std::move(message), "scan_metadata", {}, result});
 }
 
-void Inspect(ScanReport& report, const std::filesystem::directory_entry& entry,
-             std::size_t& total_dependencies) {
+void Inspect(ScanReport& report, const ReadOnlyFirmwareVfs& vfs,
+             const std::filesystem::path& relative, std::uint64_t size,
+             std::size_t& total_dependencies, std::size_t& total_metadata) {
     FileRecord file;
-    file.path = entry.path().lexically_relative(report.root);
+    file.path = relative;
     const auto quoted = Firmware900Manager::JsonString(Firmware900Manager::PathText(file.path));
     const auto filename = Lower(Firmware900Manager::PathText(file.path.filename()));
     if (filename.find("sceshellui") != std::string::npos) {
@@ -274,12 +90,15 @@ void Inspect(ScanReport& report, const std::filesystem::directory_entry& entry,
         file.shell_role = "SceShellCore_name_candidate";
     }
     try {
-        file.size = entry.file_size();
-        Reader reader(entry.path(), file.size);
+        file.size = size;
+        auto reader = vfs.OpenRelative(file.path);
+        if (reader.Size() != file.size) {
+            throw std::runtime_error("file changed before metadata scan");
+        }
         const auto prefix = reader.Read(0, std::min<std::uint64_t>(file.size, 4));
         if (prefix == std::vector<unsigned char>{0x7f, 'E', 'L', 'F'}) {
             file.kind = "ELF";
-            ParseElf(reader, file);
+            AnalyzeElfMetadata(reader, file);
         } else if (prefix == std::vector<unsigned char>{0x4f, 0x15, 0x3d, 0x1d}) {
             file.kind = "SELF";
             ParseSelf(reader, file);
@@ -302,8 +121,14 @@ void Inspect(ScanReport& report, const std::filesystem::directory_entry& entry,
         file.status = "invalid_or_unreadable";
         file.dependency_status = "incomplete";
         file.dependencies.clear();
-        file.notes.emplace_back(error.what());
-        Log(report, "ERROR", quoted + ": " + error.what());
+        file.symbols.clear();
+        file.exported_libraries.clear();
+        file.exported_modules.clear();
+        file.notes.emplace_back(PublicError(error));
+        Log(report, "ERROR", quoted + ": " + PublicError(error));
+        report.diagnostics.back().related = Firmware900Manager::PathText(file.path);
+        report.diagnostics.back().operation =
+            file.kind == "SELF" ? "SELF_validate" : "ELF_validate";
     }
     if (file.dependencies.size() > MaxTotalDependencies - total_dependencies) {
         file.dependencies.resize(MaxTotalDependencies - total_dependencies);
@@ -312,9 +137,42 @@ void Inspect(ScanReport& report, const std::filesystem::directory_entry& entry,
         Log(report, "ERROR", quoted + ": total dependency limit reached");
     }
     total_dependencies += file.dependencies.size();
+    bool clipped{};
+    const auto budget = [&](auto& values) {
+        const auto count = std::min(values.size(), std::size_t{16384} - total_metadata);
+        clipped |= count != values.size();
+        values.resize(count);
+        total_metadata += count;
+    };
+    budget(file.symbols);
+    budget(file.exported_libraries);
+    budget(file.exported_modules);
+    if (file.elf) {
+        budget(file.elf->segments);
+        if (file.elf->relocation_types.size() > 16384 - total_metadata) {
+            file.elf->relocation_types.clear();
+            clipped = true;
+        } else {
+            total_metadata += file.elf->relocation_types.size();
+        }
+    }
+    if (clipped) {
+        report.complete = false;
+        file.symbol_status = "incomplete_metadata_limit";
+        Log(report, "ERROR", quoted + ": global metadata limit reached");
+    }
     Log(report, "LOADER", quoted + " kind=" + file.kind + " status=" + file.status);
+    if (file.kind == "ELF" || file.kind == "SELF") {
+        Log(report, file.kind == "ELF" ? "ELF_LOADER" : "SELF_LOADER", quoted + " " + file.status);
+    }
+    Log(report, "VFS", quoted + ": read-only descriptor access; status=" + file.status);
+    report.diagnostics.back().operation = "read_metadata_readonly";
+    report.diagnostics.back().related = Firmware900Manager::PathText(file.path);
+    report.diagnostics.back().result = file.status;
     if (!file.shell_role.empty()) {
         Log(report, "MODULES", quoted + " " + file.shell_role + "; boot not evaluated");
+        Log(report, file.shell_role.starts_with("SceShellUI") ? "SCESHELLUI" : "SCESHELLCORE",
+            quoted + " format=" + file.kind + " status=" + file.status + "; loading disabled");
     }
     report.files.push_back(std::move(file));
 }
@@ -343,6 +201,31 @@ void StringArray(std::ostream& out, const std::vector<std::string>& values) {
             out << ',';
         }
         out << Firmware900Manager::JsonString(value);
+    }
+    out << ']';
+}
+
+std::string PublicError(const std::exception& error) {
+    if (const auto* fs_error = dynamic_cast<const std::filesystem::filesystem_error*>(&error)) {
+        return fs_error->code().message();
+    }
+    return error.what();
+}
+
+void Identity(std::ostream& out, const ModuleIdentity& identity) {
+    out << "{\"name\":" << Firmware900Manager::JsonString(identity.name)
+        << ",\"id\":" << identity.id << ",\"version\":" << identity.version
+        << ",\"minor_version\":" << identity.minor_version << '}';
+}
+
+void Identities(std::ostream& out, const std::vector<ModuleIdentity>& identities) {
+    out << '[';
+    bool first = true;
+    for (const auto& identity : identities) {
+        if (!std::exchange(first, false)) {
+            out << ',';
+        }
+        Identity(out, identity);
     }
     out << ']';
 }
@@ -395,7 +278,7 @@ std::string Firmware900Manager::JsonString(const std::string& value) {
 ScanReport Firmware900Manager::Scan(const std::filesystem::path& directory,
                                     std::size_t max_entries) const {
     ScanReport report;
-    Log(report, "PISTATION", "Firmware 9.00 Dashboard: offline diagnostic mode");
+    Log(report, "PISTATION", "Firmware 9.00 Dashboard — Experimental: offline diagnostic mode");
     Log(report, "FIRMWARE900", "Firmware version, loader compatibility and boot are not validated");
     try {
         if (directory.empty() || !std::filesystem::is_directory(directory) || max_entries == 0) {
@@ -404,45 +287,26 @@ ScanReport Firmware900Manager::Scan(const std::filesystem::path& directory,
         }
         report.root = std::filesystem::canonical(directory);
         report.input_valid = true;
-        std::error_code ec;
-        std::filesystem::recursive_directory_iterator iterator(report.root, ec), end;
-        std::size_t visited{};
+        ReadOnlyFirmwareVfs vfs(report.root);
+        const auto listing = vfs.Enumerate(max_entries);
+        report.complete = listing.complete;
         std::size_t total_dependencies{};
-        while (!ec && iterator != end) {
-            if (visited++ >= max_entries) {
-                report.complete = false;
-                Log(report, "ERROR", "entry limit reached; scan is incomplete");
-                break;
-            }
-            const auto entry = *iterator;
-            const auto status = entry.symlink_status(ec);
-            if (ec) {
-                break;
-            }
-            if (std::filesystem::is_symlink(status)) {
-                iterator.disable_recursion_pending();
-                Log(report, "FIRMWARE900",
-                    "symlink skipped: " +
-                        JsonString(PathText(entry.path().lexically_relative(report.root))));
-            } else if (std::filesystem::is_regular_file(status)) {
-                Inspect(report, entry, total_dependencies);
-            } else if (!std::filesystem::is_directory(status)) {
-                Log(report, "FIRMWARE900",
-                    "special file skipped: " +
-                        JsonString(PathText(entry.path().lexically_relative(report.root))));
-            }
-            iterator.increment(ec);
+        std::size_t total_metadata{};
+        for (const auto& entry : listing.files) {
+            Inspect(report, vfs, entry.path, entry.size, total_dependencies, total_metadata);
         }
-        if (ec) {
-            report.complete = false;
-            Log(report, "ERROR", "directory traversal failed: " + ec.message());
+        for (const auto& skipped : listing.skipped) {
+            Log(report, "VFS", "symlink or special file skipped: " + JsonString(PathText(skipped)));
+        }
+        for (const auto& error : listing.errors) {
+            Log(report, "ERROR", error);
         }
         if (report.files.empty()) {
             Log(report, "ERROR", "input contains no scanned regular files");
         }
     } catch (const std::exception& error) {
         report.complete = false;
-        Log(report, "ERROR", error.what());
+        Log(report, "ERROR", PublicError(error));
     }
     std::ranges::sort(report.files, {}, [](const FileRecord& file) { return file.path; });
     std::map<std::string, std::vector<std::string>> filenames;
@@ -501,9 +365,10 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
     if (!out) {
         throw std::runtime_error("cannot create report; parent must exist and output must be new");
     }
-    out << std::boolalpha << "{\n\"schema_version\":1,\"mode\":\"Firmware 9.00 Dashboard\","
+    out << std::boolalpha
+        << "{\n\"schema_version\":2,\"mode\":\"Firmware 9.00 Dashboard — Experimental\","
         << "\"firmware_version_verified\":false,\"boot_attempted\":false,"
-        << "\"symbol_resolution\":\"not_evaluated\",\"root\":" << JsonString(PathText(report.root))
+        << "\"symbol_resolution\":\"not_evaluated\",\"root\":\"<user-selected-directory>\""
         << ",\"input_valid\":" << report.input_valid << ",\"scan_complete\":" << report.complete
         << ",\"error_count\":" << report.error_count << ",\"files\":[\n";
     bool first = true;
@@ -512,13 +377,41 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
             out << ",\n";
         }
         out << "{\"path\":" << JsonString(PathText(file.path)) << ",\"size\":" << file.size
+            << ",\"extension\":" << JsonString(PathText(file.path.extension()))
+            << ",\"module_role\":" << JsonString(file.module_role)
             << ",\"kind\":" << JsonString(file.kind) << ",\"status\":" << JsonString(file.status)
             << ",\"shell_role\":" << JsonString(file.shell_role)
             << ",\"dependency_status\":" << JsonString(file.dependency_status) << ",\"elf\":";
         if (file.elf) {
             out << "{\"type\":" << file.elf->type << ",\"machine\":" << file.elf->machine
                 << ",\"entry\":" << JsonString(Hex(file.elf->entry))
-                << ",\"program_headers\":" << file.elf->program_headers << '}';
+                << ",\"program_headers\":" << file.elf->program_headers
+                << ",\"entry_in_executable_segment\":" << file.elf->entry_in_executable_segment
+                << ",\"tls_present\":" << file.elf->tls_present
+                << ",\"symbol_table_entries\":" << file.elf->symbol_table_entries
+                << ",\"relocation_status\":" << JsonString(file.elf->relocation_status)
+                << ",\"relocation_types\":{";
+            bool first_type = true;
+            for (const auto& [type, count] : file.elf->relocation_types) {
+                if (!std::exchange(first_type, false)) {
+                    out << ',';
+                }
+                out << JsonString(std::to_string(type)) << ':' << count;
+            }
+            out << "},\"segments\":[";
+            bool first_segment = true;
+            for (const auto& segment : file.elf->segments) {
+                if (!std::exchange(first_segment, false)) {
+                    out << ',';
+                }
+                out << "{\"type\":" << segment.type << ",\"flags\":" << segment.flags
+                    << ",\"offset\":" << segment.offset
+                    << ",\"address\":" << JsonString(Hex(segment.address))
+                    << ",\"file_size\":" << segment.file_size
+                    << ",\"memory_size\":" << segment.memory_size
+                    << ",\"alignment\":" << segment.alignment << '}';
+            }
+            out << "]}";
         } else {
             out << "null";
         }
@@ -538,29 +431,142 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
                 out << ',';
             }
             out << "{\"kind\":" << JsonString(dependency.kind)
-                << ",\"name\":" << JsonString(dependency.name)
+                << ",\"name\":" << JsonString(dependency.name) << ",\"id\":" << dependency.id
+                << ",\"version\":" << dependency.version
+                << ",\"minor_version\":" << dependency.minor_version
                 << ",\"resolution\":\"not_evaluated\","
                 << "\"filename_candidates\":";
             StringArray(out, dependency.filename_candidates);
             out << ",\"filename_candidates_truncated\":" << dependency.candidates_truncated << '}';
         }
+        out << "],\"module_identity\":";
+        if (file.module_identity) {
+            Identity(out, *file.module_identity);
+        } else {
+            out << "null";
+        }
+        out << ",\"exported_libraries\":";
+        Identities(out, file.exported_libraries);
+        out << ",\"exported_modules\":";
+        Identities(out, file.exported_modules);
+        out << ",\"symbol_status\":" << JsonString(file.symbol_status) << ",\"symbols\":[";
+        bool first_symbol = true;
+        for (const auto& symbol : file.symbols) {
+            if (!std::exchange(first_symbol, false)) {
+                out << ',';
+            }
+            out << "{\"name\":" << JsonString(symbol.name)
+                << ",\"library\":" << JsonString(symbol.library)
+                << ",\"module\":" << JsonString(symbol.module)
+                << ",\"type\":" << unsigned{symbol.type}
+                << ",\"library_version\":" << symbol.library_version << ",\"weak\":" << symbol.weak
+                << ",\"qualified\":" << symbol.qualified << ",\"imported\":" << symbol.imported
+                << '}';
+        }
         out << "],\"notes\":";
         StringArray(out, file.notes);
         out << '}';
     }
-    out << "\n],\"diagnostics\":[";
+    out << "\n],\"analysis\":{\"complete\":" << report.analysis.complete
+        << ",\"hle_registry_checked\":" << report.analysis.hle_registry_checked << ",\"edges\":[";
+    first = true;
+    for (const auto& edge : report.analysis.edges) {
+        if (!std::exchange(first, false)) {
+            out << ',';
+        }
+        out << "{\"from\":" << JsonString(edge.from) << ",\"name\":" << JsonString(edge.name)
+            << ",\"kind\":" << JsonString(edge.kind) << ",\"status\":" << JsonString(edge.status)
+            << ",\"targets\":";
+        StringArray(out, edge.targets);
+        out << '}';
+    }
+    out << "],\"imports\":[";
+    first = true;
+    for (const auto& symbol : report.analysis.imports) {
+        if (!std::exchange(first, false)) {
+            out << ',';
+        }
+        out << "{\"from\":" << JsonString(symbol.from) << ",\"name\":" << JsonString(symbol.name)
+            << ",\"library\":" << JsonString(symbol.library)
+            << ",\"module\":" << JsonString(symbol.module)
+            << ",\"status\":" << JsonString(symbol.status)
+            << ",\"provider\":" << JsonString(symbol.provider) << '}';
+    }
+    out << "],\"cycles\":[";
+    first = true;
+    for (const auto& cycle : report.analysis.cycles) {
+        if (!std::exchange(first, false)) {
+            out << ',';
+        }
+        StringArray(out, cycle);
+    }
+    out << "]},\"diagnostics\":[";
     first = true;
     for (const auto& diagnostic : report.diagnostics) {
         if (!std::exchange(first, false)) {
             out << ',';
         }
         out << "{\"category\":" << JsonString(diagnostic.category)
-            << ",\"message\":" << JsonString(diagnostic.message) << '}';
+            << ",\"message\":" << JsonString(diagnostic.message)
+            << ",\"operation\":" << JsonString(diagnostic.operation)
+            << ",\"related\":" << JsonString(diagnostic.related)
+            << ",\"result\":" << JsonString(diagnostic.result) << '}';
     }
     out << "]}\n";
     out.close();
     if (!out) {
         throw std::runtime_error("report write failed; output may be incomplete");
+    }
+}
+
+void Firmware900Manager::WriteTextReport(const ScanReport& report,
+                                         const std::filesystem::path& output) {
+    if (report.input_valid && IsWithin(std::filesystem::weakly_canonical(output), report.root)) {
+        throw std::runtime_error("report must be outside the scanned directory");
+    }
+    std::ofstream out(output, std::ios::out | std::ios::noreplace);
+    if (!out) {
+        throw std::runtime_error("cannot create text report; output must be new");
+    }
+    out << "Firmware 9.00 Dashboard — Experimental\nOffline metadata only. Boot disabled. "
+           "Firmware version and runtime symbol resolution not verified.\n";
+    for (const auto& file : report.files) {
+        out << "\n" << JsonString(PathText(file.path)) << " [" << file.kind << "] " << file.status;
+        if (file.elf) {
+            out << " entry=" << Hex(file.elf->entry) << " tls=" << file.elf->tls_present;
+        }
+        out << '\n';
+    }
+    for (const auto& edge : report.analysis.edges) {
+        out << JsonString(edge.from) << " -> " << JsonString(edge.name) << ": " << edge.status
+            << '\n';
+    }
+    for (const auto& symbol : report.analysis.imports) {
+        out << JsonString(symbol.from) << " imports " << JsonString(symbol.name) << ": "
+            << symbol.status << '\n';
+    }
+    for (const auto& cycle : report.analysis.cycles) {
+        out << "Cycle: ";
+        StringArray(out, cycle);
+        out << '\n';
+    }
+    Emit(report, [&](const Diagnostic& diagnostic) {
+        out << '[' << diagnostic.category << "] operation=" << JsonString(diagnostic.operation)
+            << " related=" << JsonString(diagnostic.related)
+            << " result=" << JsonString(diagnostic.result) << ' ' << JsonString(diagnostic.message)
+            << '\n';
+    });
+    out.close();
+    if (!out) {
+        throw std::runtime_error("text report write failed");
+    }
+}
+
+void Firmware900Manager::Emit(const ScanReport& report, const DiagnosticSink& sink) {
+    if (sink) {
+        for (const auto& diagnostic : report.diagnostics) {
+            sink(diagnostic);
+        }
     }
 }
 

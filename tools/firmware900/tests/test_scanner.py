@@ -60,6 +60,69 @@ def self_container(flags=None):
     return header
 
 
+def analyzed_elf(needed=(), symbols=(), soname=None, relocations=(), tls=False,
+                 sce=False, module='libExampleModule', exported_library='libExample',
+                 imported_module=None, imported_library=None, library_version=1):
+    base = 0x400000
+    strings = bytearray(b'\0')
+
+    def name_offset(name):
+        offset = len(strings)
+        strings.extend(name.encode('utf-8') + b'\0')
+        return offset
+
+    entries = [(1, name_offset(name)) for name in needed]
+    if soname:
+        entries.append((14, name_offset(soname)))
+    if sce:
+        entries.append((0x6100000D, name_offset(module) | (1 << 40) | (7 << 48)))
+        if exported_library:
+            entries.append((0x61000013, name_offset(exported_library) |
+                            (library_version << 32) | (5 << 48)))
+        if imported_module:
+            entries.append((0x6100000F, name_offset(imported_module) | (1 << 40) | (3 << 48)))
+        if imported_library:
+            entries.append((0x61000015, name_offset(imported_library) | (1 << 32) | (2 << 48)))
+    symbol_bytes = bytearray(24)
+    for name, imported, symbol_type, weak in symbols:
+        symbol_bytes.extend(struct.pack('<IBBHQQ', name_offset(name),
+                                        ((2 if weak else 1) << 4) | symbol_type,
+                                        0, 0 if imported else 1,
+                                        0 if imported else base + 0x180, 8))
+    data = bytearray(0x1800)
+    count = 3 if sce or tls else 2
+    data[:64] = elf_header(phnum=count, elf_type=3)
+    struct.pack_into('<Q', data, 24, base + 0x180)
+    if sce:
+        entries += [(0x61000035, 0), (0x61000037, len(strings)),
+                    (0x61000039, 0x200), (0x6100003F, len(symbol_bytes)), (0x6100003B, 24)]
+    else:
+        entries += [(5, base + 0x1000), (10, len(strings)), (6, base + 0x1200),
+                    (11, 24), (4, base + 0x1400)]
+    rela = b''.join(struct.pack('<QQq', address, (symbol << 32) | kind, addend)
+                    for address, kind, symbol, addend in relocations)
+    if rela:
+        entries += [(7, base + 0x1500), (8, len(rela)), (9, 24)]
+    entries.append((0, 0))
+    dynamic = b''.join(struct.pack('<QQ', *entry) for entry in entries)
+    assert len(dynamic) < 0xE00 and len(strings) < 0x200
+    data[64:120] = struct.pack('<IIQQQQQQ', 1, 5, 0, base, 0, len(data), len(data), 0x1000)
+    data[120:176] = struct.pack('<IIQQQQQQ', 2, 4, 0x200, base + 0x200, 0,
+                                len(dynamic), len(dynamic), 8)
+    if sce:
+        data[176:232] = struct.pack('<IIQQQQQQ', 0x61000000, 4, 0x1000, 0, 0, 0x800, 0x800, 1)
+    elif tls:
+        data[176:232] = struct.pack('<IIQQQQQQ', 7, 4, 0x1700, base + 0x1700, 0, 4, 16, 4)
+    data[0x200:0x200 + len(dynamic)] = dynamic
+    data[0x1000:0x1000 + len(strings)] = strings
+    data[0x1200:0x1200 + len(symbol_bytes)] = symbol_bytes
+    chain_count = len(symbol_bytes) // 24
+    hash_data = struct.pack('<II', 1, chain_count) + bytes(4 * (1 + chain_count))
+    data[0x1400:0x1400 + len(hash_data)] = hash_data
+    data[0x1500:0x1500 + len(rela)] = rela
+    return data
+
+
 class ScannerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='pistation-synthetic-')
@@ -363,6 +426,197 @@ class ScannerTests(unittest.TestCase):
         _, report = self.scan(1)
         self.assertEqual(len(report['files']), 100)
         self.assertGreater(report['error_count'], 0)
+
+    def test_phase2_segments_entry_tls_and_relocations(self):
+        self.write('SceShellUI.elf', analyzed_elf(tls=True, relocations=[(0x400180, 8, 0, 0)]))
+        _, report = self.scan()
+        elf = report['files'][0]['elf']
+        self.assertTrue(elf['entry_in_executable_segment'])
+        self.assertTrue(elf['tls_present'])
+        self.assertEqual(elf['relocation_types'], {'8': 1})
+        self.assertEqual(elf['relocation_status'], 'metadata_only_not_applied')
+        self.assertEqual(len(elf['segments']), 3)
+
+    def test_phase2_static_import_export_match(self):
+        self.write('SceShellUI.elf', analyzed_elf(needed=['libExample.sprx'],
+                   symbols=[('synthetic_function', True, 2, False)]))
+        self.write('libExample.sprx', analyzed_elf(soname='libExample.sprx',
+                   symbols=[('synthetic_function', False, 2, False)]))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['edges'][0]['status'], 'available_metadata_not_loaded')
+        self.assertEqual(report['analysis']['imports'][0]['status'], 'matched_lle_export_not_loaded')
+        self.assertFalse(report['analysis']['hle_registry_checked'])
+        self.assertFalse(report['boot_attempted'])
+
+    def test_phase2_missing_dependency_and_import(self):
+        self.write('shell', analyzed_elf(needed=['missing.sprx'], symbols=[('missing', True, 2, False)]))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['edges'][0]['status'], 'missing_from_inventory')
+        self.assertEqual(report['analysis']['imports'][0]['status'], 'unresolved_static_runtime_unknown')
+
+    def test_phase2_dependency_cycle(self):
+        self.write('a.sprx', analyzed_elf(needed=['b.sprx']))
+        self.write('b.sprx', analyzed_elf(needed=['a.sprx']))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['cycles'], [['a.sprx', 'b.sprx', 'a.sprx']])
+
+    def test_phase2_unrelated_export_does_not_resolve(self):
+        self.write('shell', analyzed_elf(symbols=[('same_name', True, 2, False)]))
+        self.write('unrelated.sprx', analyzed_elf(symbols=[('same_name', False, 2, False)]))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['imports'][0]['status'], 'unresolved_static_runtime_unknown')
+
+    def test_phase2_weak_symbol_is_not_implemented(self):
+        self.write('shell', analyzed_elf(symbols=[('optional', True, 2, True)]))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['imports'][0]['status'], 'weak_undefined')
+
+    def test_phase2_sce_qualified_ids_match_metadata_names(self):
+        self.write('shell', analyzed_elf(sce=True, module='shell', exported_library=None,
+                   imported_module='libExampleModule', imported_library='libExample',
+                   symbols=[('syntheticNid#C#D', True, 2, False)]))
+        self.write('provider.sprx', analyzed_elf(sce=True,
+                   symbols=[('syntheticNid#F#H', False, 2, False)]))
+        _, report = self.scan()
+        symbol = report['analysis']['imports'][0]
+        self.assertEqual(symbol['name'], 'syntheticNid')
+        self.assertEqual(symbol['library'], 'libExample')
+        self.assertEqual(symbol['module'], 'libExampleModule')
+        self.assertEqual(symbol['status'], 'matched_lle_export_not_loaded')
+
+    def test_phase2_sce_version_difference(self):
+        self.write('shell', analyzed_elf(sce=True, module='shell', exported_library=None,
+                   imported_module='libExampleModule', imported_library='libExample',
+                   symbols=[('syntheticNid#C#D', True, 2, False)]))
+        self.write('provider.sprx', analyzed_elf(sce=True, library_version=2,
+                   symbols=[('syntheticNid#F#H', False, 2, False)]))
+        _, report = self.scan()
+        self.assertIn('version_difference_requires_review', [e['status'] for e in report['analysis']['edges']])
+        self.assertNotEqual(report['analysis']['imports'][0]['status'], 'matched_lle_export_not_loaded')
+
+    def test_phase2_bad_relocation_address(self):
+        self.write('bad', analyzed_elf(relocations=[(2**64-1, 8, 0, 0)]))
+        self.scan(1)
+
+    def test_phase2_bad_relocation_symbol_index(self):
+        self.write('bad', analyzed_elf(relocations=[(0x400180, 1, 999, 0)]))
+        self.scan(1)
+
+    def test_phase2_bad_alignment(self):
+        data = analyzed_elf()
+        struct.pack_into('<Q', data, 64 + 48, 3)
+        self.write('bad', data)
+        self.scan(1)
+
+    def test_phase2_unknown_relocation_recorded_without_application(self):
+        self.write('unknown', analyzed_elf(relocations=[(0x400180, 999, 0, 0)]))
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['elf']['relocation_types'], {'999': 1})
+        self.assertFalse(report['boot_attempted'])
+
+    def test_phase2_vfs_read_only_mapping_and_logs(self):
+        path = self.write('modules/file.elf', elf_header())
+        original = path.read_bytes()
+        result, report = self.scan(extra=('--mount', '/system=modules', '--vfs-path', '/system/file.elf'))
+        self.assertIn('[VFS]', result.stdout)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(any(d['category'] == 'VFS' and d['result'] == 'allowed' for d in report['diagnostics']))
+
+    def test_phase2_vfs_traversal_rejected(self):
+        self.write('file.elf', elf_header())
+        _, report = self.scan(1, extra=('--vfs-path', '/../outside'))
+        self.assertTrue(any(d['operation'] == 'VFS_open_readonly' and d['result'] == 'denied'
+                            for d in report['diagnostics']))
+
+    def test_phase2_vfs_mount_escape_rejected(self):
+        self.write('file', b'file')
+        self.scan(1, extra=('--mount', '/system=../'))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX symlink test')
+    def test_phase2_vfs_symlink_escape_rejected(self):
+        outside = self.base / 'private'
+        outside.mkdir()
+        (outside / 'secret').write_text('must not be read')
+        self.write('normal', b'data')
+        (self.root / 'escape').symlink_to(outside, target_is_directory=True)
+        _, report = self.scan(1, extra=('--vfs-path', '/escape/secret'))
+        self.assertNotIn('must not be read', self.output.read_text())
+        self.assertEqual(len(report['files']), 1)
+
+    def test_phase2_vfs_missing_mapping_directory(self):
+        self.write('file', b'data')
+        self.scan(1, extra=('--mount', '/system=missing'))
+
+    def test_phase2_reports_are_readable_and_host_root_redacted(self):
+        self.write('SceShellUI.elf', analyzed_elf(needed=['missing.sprx']))
+        text = self.base / 'report.txt'
+        _, report = self.scan(extra=('--text-report', str(text)))
+        self.assertIn('missing_from_inventory', text.read_text())
+        self.assertNotIn(str(self.root), text.read_text())
+        self.assertNotIn(str(self.root), self.output.read_text())
+        self.assertEqual(report['schema_version'], 2)
+
+    def test_phase2_text_report_cannot_overwrite_input(self):
+        file = self.write('file', b'keep me')
+        result = subprocess.run([str(SCANNER), '--firmware-dir', str(self.root),
+                                 '--report', str(self.output), '--text-report', str(file)],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(file.read_bytes(), b'keep me')
+
+    def test_phase2_section_dynamic_symbols(self):
+        data = analyzed_elf(symbols=[('section_export', False, 2, False)])
+        string_size = None
+        for offset in range(0x200, 0x1000, 16):
+            tag, value = struct.unpack_from('<QQ', data, offset)
+            if tag == 10:
+                string_size = value
+            if tag == 4:
+                struct.pack_into('<Q', data, offset, 21)
+            if tag == 0:
+                break
+        struct.pack_into('<Q', data, 40, 0x800)
+        struct.pack_into('<HH', data, 58, 64, 3)
+        struct.pack_into('<IIQQQQIIQQ', data, 0x840, 0, 11, 0, 0, 0x1200, 48, 2, 0, 8, 24)
+        struct.pack_into('<IIQQQQIIQQ', data, 0x880, 0, 3, 0, 0, 0x1000, string_size, 0, 0, 1, 0)
+        self.write('section.elf', data)
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['symbol_status'], 'parsed_dynamic_symbols')
+        self.assertEqual(report['files'][0]['symbols'][0]['name'], 'section_export')
+
+    def test_phase2_protected_provider_is_not_available(self):
+        self.write('shell', analyzed_elf(needed=['protected.sprx']))
+        self.write('protected.sprx', self_container(flags=2))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['edges'][0]['status'], 'protected_self_unavailable')
+
+    def test_phase2_incompatible_machine_provider(self):
+        self.write('shell', analyzed_elf(needed=['arm.sprx']))
+        self.write('arm.sprx', elf_header(machine=183))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['edges'][0]['status'], 'incompatible_file_metadata')
+
+    def test_phase2_bad_sce_qualification_is_not_resolved(self):
+        self.write('shell', analyzed_elf(sce=True, module='shell', imported_module='libExampleModule',
+                   imported_library='libExample', symbols=[('syntheticNid#Z#Z', True, 2, False)]))
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['imports'][0]['status'], 'unverified_symbol_qualification')
+
+    def test_phase2_empty_file_is_not_an_executable(self):
+        self.write('empty.sprx', b'')
+        _, report = self.scan()
+        self.assertIsNone(report['files'][0]['elf'])
+        self.assertEqual(report['files'][0]['size'], 0)
+        self.assertEqual(report['files'][0]['kind'], 'unknown')
+
+    def test_phase2_loading_option_is_unavailable(self):
+        result = subprocess.run([str(SCANNER), '--load', 'SceShellUI'],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+
+    def test_phase2_vfs_oversized_guest_path_is_rejected(self):
+        self.write('normal', b'data')
+        self.scan(1, extra=('--vfs-path', '/' + 'x' * 4096))
 
 
 if __name__ == '__main__':

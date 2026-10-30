@@ -2,9 +2,11 @@
 cmake_minimum_required(VERSION 3.24)
 project(PiStationFirmware900 LANGUAGES CXX)
 
-add_library(firmware900_manager firmware900_manager.cpp)
+add_library(firmware900_manager firmware900_manager.cpp read_only_firmware_vfs.cpp
+    firmware900_dependency_analyzer.cpp elf_metadata_parser.cpp)
 target_compile_features(firmware900_manager PUBLIC cxx_std_23)
 target_include_directories(firmware900_manager PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(firmware900_manager PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
 set_target_properties(firmware900_manager PROPERTIES CXX_EXTENSIONS OFF)
 if(MSVC)
     target_compile_options(firmware900_manager PRIVATE /W4)
@@ -22,4 +24,7 @@ if(PISTATION_ENABLE_TESTS)
     add_test(NAME firmware900_scanner
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scanner.py"
             --scanner "$<TARGET_FILE:pistation-firmware900>")
+    add_executable(firmware900_hle_adapter_test tests/test_hle_adapter.cpp)
+    target_link_libraries(firmware900_hle_adapter_test PRIVATE firmware900_manager)
+    add_test(NAME firmware900_hle_adapter COMMAND firmware900_hle_adapter_test)
 endif()
