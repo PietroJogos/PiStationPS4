@@ -125,13 +125,12 @@ void Firmware900BootDiagnostic::Analyze(ScanReport& report) const {
         image.role = file.module_role;
         image.process_candidate = !file.shell_role.empty();
         image.blockers = {"runtime_execution_disabled", "module_initialization_not_attempted"};
-        if (file.status != "metadata_validated" || !file.elf) {
-            if (file.status == "diagnostic_limit_exceeded" ||
-                file.status == "unsupported_metadata") {
-                Block(image.blockers, "parser_" + file.status);
-            }
+        if (file.status != "metadata_validated") {
+            Block(image.blockers, "parser_" + file.status);
+        }
+        if (!file.elf || !file.elf->segments_validated) {
             Block(image.blockers, file.self ? "self_payload_unavailable_for_analysis"
-                                            : "executable_metadata_invalid_or_unavailable");
+                                            : "executable_segments_unavailable_or_unvalidated");
         } else {
             const auto& elf = *file.elf;
             image.entry = elf.entry;

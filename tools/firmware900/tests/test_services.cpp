@@ -104,6 +104,7 @@ int main() {
 
     report = Input("UnknownNidA");
     auto& elf = *report.files.front().elf;
+    elf.segments_validated = true;
     elf.entry = 0x400180;
     elf.entry_in_executable_segment = true;
     elf.tls_present = true;

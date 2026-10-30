@@ -747,31 +747,31 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(file['elf']['relocation_status'], 'unsupported_metadata')
         self.assertFalse(report['analysis']['complete'])
 
-    def oversized_sce_table(self, symbols=False):
+    def oversized_sce_table(self, symbols=False, count=4097):
         data = analyzed_elf(sce=True, needed=['dependency.sprx'])
-        data.extend(bytes(0x2000 + 4097 * 24 - len(data)))
+        data.extend(bytes(0x2000 + count * 24 - len(data)))
         struct.pack_into('<QQ', data, 176 + 32, len(data)-0x1000, len(data)-0x1000)
         if symbols:
-            self.patch_dynamic(data, {0x61000039: 0x1000, 0x6100003f: 4097 * 24})
+            self.patch_dynamic(data, {0x61000039: 0x1000, 0x6100003f: count * 24})
         else:
-            self.patch_dynamic(data, {0x6100002f: 0x1000, 0x61000031: 4097 * 24, 0x61000033: 24})
+            self.patch_dynamic(data, {0x6100002f: 0x1000, 0x61000031: count * 24, 0x61000033: 24})
         return data
 
-    def test_parser_large_relocation_table_is_limit_not_corrupt(self):
+    def test_parser_4097_relocations_fit_chunked_reader(self):
         self.write('SceShellCore.elf', self.oversized_sce_table())
-        _, report = self.scan(1)
+        _, report = self.scan()
         file = report['files'][0]
-        self.assertEqual(file['status'], 'diagnostic_limit_exceeded')
+        self.assertEqual(file['status'], 'metadata_validated')
         self.assertEqual(file['dependencies'][0]['name'], 'dependency.sprx')
-        self.assertEqual(file['elf']['relocation_status'], 'diagnostic_limit_exceeded')
+        self.assertEqual(file['elf']['relocation_entries_examined'], 4097)
 
-    def test_parser_large_symbol_table_is_limit_not_corrupt(self):
+    def test_parser_4097_symbols_fit_chunked_reader(self):
         self.write('library.sprx', self.oversized_sce_table(symbols=True))
-        _, report = self.scan(1)
+        _, report = self.scan()
         file = report['files'][0]
-        self.assertEqual(file['status'], 'diagnostic_limit_exceeded')
-        self.assertEqual(file['symbol_status'], 'diagnostic_limit_exceeded')
-        self.assertEqual(file['elf']['symbol_table_entries'], 4097)
+        self.assertEqual(file['status'], 'metadata_validated')
+        self.assertEqual(file['symbol_status'], 'parsed_dynamic_symbols')
+        self.assertEqual(file['elf']['symbol_entries_examined'], 4097)
 
     def test_parser_bad_large_table_range_is_invalid_before_limit(self):
         data = self.oversized_sce_table()
@@ -792,6 +792,77 @@ class ScannerTests(unittest.TestCase):
         self.write('library.sprx', data)
         _, report = self.scan(1)
         self.assertEqual(report['files'][0]['status'], 'unsupported_metadata')
+
+    def test_streamed_shellcore_scale_and_larger_than_4mib_table(self):
+        for count in (29006, 175680):
+            with self.subTest(count=count):
+                data = self.oversized_sce_table(count=count)
+                struct.pack_into('<QQq', data, 0x2000 + (count - 1) * 24, 0x400180, 8, 0)
+                self.write('system/vsh/SceShellCore.elf', data)
+                _, report = self.scan(output=self.base / f'stream-{count}.json', extra=('--boot-diagnostic',))
+                file = report['files'][0]
+                self.assertEqual(file['elf']['relocation_entries_examined'], count)
+                self.assertEqual(file['elf']['relocation_types'], {'0': count - 1, '8': 1})
+                self.assertTrue(file['elf']['segments_validated'])
+                self.assertEqual(report['boot_diagnostic']['images'][0]['entry'], 0x400180)
+                self.assertGreater(report['boot_diagnostic']['images'][0]['load_segments'], 0)
+                self.assertEqual(report['parser_revision'], 'bounded-tables-v1')
+                self.assertEqual(report['parser_limits']['chunk_entries'], 1024)
+                self.assertFalse(report['boot_attempted'])
+
+    def test_streamed_invalid_target_after_first_chunk_is_not_skipped(self):
+        data = self.oversized_sce_table(count=175680)
+        struct.pack_into('<QQq', data, len(data) - 24, 2**64-1, 8, 0)
+        self.write('invalid', data)
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'invalid_or_unreadable')
+        self.assertIn('index=175679', report['files'][0]['notes'][-1])
+
+    def test_streamed_real_report_symbol_scale(self):
+        data = self.oversized_sce_table(symbols=True, count=28269)
+        self.write('symbols.sprx', data)
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['elf']['symbol_entries_examined'], 28269)
+
+    def test_streamed_symbol_bad_name_after_chunk_is_not_skipped(self):
+        data = self.oversized_sce_table(symbols=True)
+        struct.pack_into('<I', data, 0x2000 + 1024 * 24, 2**32-1)
+        self.write('invalid', data)
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'invalid_or_unreadable')
+
+    def test_streamed_per_file_relocation_hard_limit_remains(self):
+        self.write('SceShellCore.elf', self.oversized_sce_table(count=1048577))
+        _, report = self.scan(1, extra=('--boot-diagnostic',))
+        file = report['files'][0]
+        self.assertEqual(file['status'], 'diagnostic_limit_exceeded')
+        self.assertEqual(file['elf']['relocation_entries_examined'], 0)
+        self.assertGreater(len(file['elf']['segments']), 0)
+        self.assertGreater(report['boot_diagnostic']['images'][0]['entry'], 0)
+        self.assertFalse(report['boot_diagnostic']['boot_allowed'])
+
+    def test_streamed_per_file_symbol_hard_limit_remains(self):
+        self.write('symbols.sprx', self.oversized_sce_table(symbols=True, count=131073))
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'diagnostic_limit_exceeded')
+        self.assertTrue(report['files'][0]['elf']['segments_validated'])
+
+    def test_many_files_do_not_erase_later_core_segments_or_identity(self):
+        data = self.oversized_sce_table(symbols=True, count=2040)
+        symbol = struct.pack('<IBBHQQ', 1, 0x12, 0, 1, 0x400180, 8)
+        data[0x2000:] = symbol * 2040
+        for i in range(9):
+            self.write(f'a/lib{i}.sprx', data)
+        self.write('system/vsh/SceShellCore.elf', data)
+        _, report = self.scan(extra=('--boot-diagnostic',))
+        self.assertGreater(sum(len(f['symbols']) for f in report['files']), 16384)
+        core = next(f for f in report['files'] if f['path'].endswith('SceShellCore.elf'))
+        self.assertEqual(len(core['symbols']), 2040)
+        self.assertGreater(len(core['elf']['segments']), 0)
+        self.assertEqual(core['module_identity']['name'], 'libExampleModule')
+        self.assertGreater(len(core['exported_libraries']), 0)
+        self.assertEqual(core['dependencies'][0]['name'], 'dependency.sprx')
+        self.assertEqual(report['error_count'], 0)
 
     def test_shellui_path_candidate_is_not_proof_of_identity(self):
         self.write('system_ex/app/NPXS20001/eboot.bin', analyzed_elf())

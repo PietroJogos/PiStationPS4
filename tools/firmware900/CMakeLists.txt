@@ -64,6 +64,9 @@ if(PISTATION_ENABLE_TESTS)
     find_package(Threads REQUIRED)
     target_link_libraries(firmware900_services_test PRIVATE Threads::Threads)
     add_test(NAME firmware900_services COMMAND firmware900_services_test)
+    add_executable(firmware900_parser_budgets_test tests/test_parser_budgets.cpp)
+    target_link_libraries(firmware900_parser_budgets_test PRIVATE firmware900_manager)
+    add_test(NAME firmware900_parser_budgets COMMAND firmware900_parser_budgets_test)
     add_test(NAME firmware900_catalog_generator
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_catalog.py")
 
