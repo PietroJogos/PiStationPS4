@@ -41,8 +41,8 @@ void Symbols(const Input& input, FileRecord& file, std::uint64_t offset, std::ui
     file.elf->symbol_table_entries = count;
     for (std::size_t i = 0; i < count; ++i) {
         const auto base = i * sizeof(elf_symbol);
-        const auto binding = data[base + 4] >> 4;
-        const auto visibility = data[base + 5] & 3;
+        const auto binding = static_cast<unsigned>(data[base + 4]) >> 4;
+        const auto visibility = static_cast<unsigned>(data[base + 5]) & 3U;
         const auto section = ReadLe(data, base + 6, 2);
         const bool imported = sce ? ReadLe(data, base + 8, 8) == 0 : section == 0;
         const auto name = ReadString(names, ReadLe(data, base, 4));

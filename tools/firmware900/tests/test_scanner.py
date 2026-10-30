@@ -143,14 +143,14 @@ class ScannerTests(unittest.TestCase):
     def scan(self, expected=0, root=None, output=None, extra=()):
         result = subprocess.run([str(SCANNER), '--firmware-dir', str(root or self.root),
                                  '--report', str(output or self.output), *extra],
-                                capture_output=True, text=True, timeout=15)
+                                capture_output=True, text=True, encoding="utf-8", timeout=15)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         report_path = output or self.output
         report = json.loads(report_path.read_text(encoding='utf-8')) if report_path.exists() else None
         return result, report
 
     def test_help(self):
-        result = subprocess.run([str(SCANNER), '--help'], capture_output=True, text=True, timeout=5)
+        result = subprocess.run([str(SCANNER), '--help'], capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 0)
         self.assertIn('offline diagnostics', result.stdout)
 
@@ -378,6 +378,7 @@ class ScannerTests(unittest.TestCase):
         self.assertFalse(report['scan_complete'])
         self.assertEqual(len(report['files']), 1)
 
+    @unittest.skipUnless(os.name == "posix", "Quotes and control bytes are invalid Windows filenames")
     def test_json_and_logs_escape_filename(self):
         self.write('test"\n[ERROR]\\é.elf', elf_header())
         result, report = self.scan()
@@ -396,7 +397,7 @@ class ScannerTests(unittest.TestCase):
         self.write('file', b'file')
         result = subprocess.run([str(SCANNER), '--firmware-dir', str(self.root),
                                  '--report', str(self.root / 'report.json')],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 2)
         self.assertFalse((self.root / 'report.json').exists())
 
@@ -405,16 +406,16 @@ class ScannerTests(unittest.TestCase):
         self.output.write_text('keep existing data')
         result = subprocess.run([str(SCANNER), '--firmware-dir', str(self.root),
                                  '--report', str(self.output)],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(self.output.read_text(), 'keep existing data')
+        self.assertEqual(self.output.read_text(encoding="utf-8"), 'keep existing data')
 
     def test_invalid_cli(self):
         for value in ['0', '-1', '100001', 'not-a-number', '10junk']:
             with self.subTest(value=value):
                 result = subprocess.run([str(SCANNER), '--firmware-dir', str(self.root),
                                          '--report', str(self.output), '--max-entries', value],
-                                        capture_output=True, text=True, timeout=5)
+                                        capture_output=True, text=True, encoding="utf-8", timeout=5)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(self.output.exists())
 
@@ -540,7 +541,7 @@ class ScannerTests(unittest.TestCase):
         self.write('normal', b'data')
         (self.root / 'escape').symlink_to(outside, target_is_directory=True)
         _, report = self.scan(1, extra=('--vfs-path', '/escape/secret'))
-        self.assertNotIn('must not be read', self.output.read_text())
+        self.assertNotIn('must not be read', self.output.read_text(encoding="utf-8"))
         self.assertEqual(len(report['files']), 1)
 
     def test_phase2_vfs_missing_mapping_directory(self):
@@ -551,16 +552,16 @@ class ScannerTests(unittest.TestCase):
         self.write('SceShellUI.elf', analyzed_elf(needed=['missing.sprx']))
         text = self.base / 'report.txt'
         _, report = self.scan(extra=('--text-report', str(text)))
-        self.assertIn('missing_from_inventory', text.read_text())
-        self.assertNotIn(str(self.root), text.read_text())
-        self.assertNotIn(str(self.root), self.output.read_text())
+        self.assertIn('missing_from_inventory', text.read_text(encoding="utf-8"))
+        self.assertNotIn(str(self.root), text.read_text(encoding="utf-8"))
+        self.assertNotIn(str(self.root), self.output.read_text(encoding="utf-8"))
         self.assertEqual(report['schema_version'], 3)
 
     def test_phase2_text_report_cannot_overwrite_input(self):
         file = self.write('file', b'keep me')
         result = subprocess.run([str(SCANNER), '--firmware-dir', str(self.root),
                                  '--report', str(self.output), '--text-report', str(file)],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(file.read_bytes(), b'keep me')
 
@@ -611,12 +612,61 @@ class ScannerTests(unittest.TestCase):
 
     def test_phase2_loading_option_is_unavailable(self):
         result = subprocess.run([str(SCANNER), '--load', 'SceShellUI'],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 2)
 
     def test_phase2_vfs_oversized_guest_path_is_rejected(self):
         self.write('normal', b'data')
         self.scan(1, extra=('--vfs-path', '/' + 'x' * 4096))
+
+    def test_portable_unicode_spaces_and_metadata_escaping(self):
+        name = 'pasta com espaços/ação 日本語.elf'
+        self.write(name, dynamic_elf(name='lib\"\n[ERROR]é.sprx'.encode('utf-8')))
+        result, report = self.scan(extra=('--vfs-path', '/' + name))
+        self.assertEqual(report['files'][0]['path'], name)
+        self.assertEqual(report['files'][0]['dependencies'][0]['name'], 'lib\"\n[ERROR]é.sprx')
+        self.assertNotIn('\n[ERROR]', result.stdout)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows namespace semantics')
+    def test_windows_namespace_paths_are_denied(self):
+        self.write('plain', b'data')
+        for i, path in enumerate(['/plain:stream', '/C:/Windows', '/plain.', '/plain ', '//server/file']):
+            self.scan(1, output=self.base / f'denied{i}.json', extra=('--vfs-path', path))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_windows_junction_is_not_followed(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'secret.elf').write_bytes(elf_header())
+        self.write('normal.elf', elf_header())
+        junction = self.root / 'junction'
+        result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(junction), str(outside)],
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, repr(result.stderr))
+        try:
+            _, report = self.scan(1, extra=('--vfs-path', '/junction/secret.elf'))
+            self.assertEqual([f['path'] for f in report['files']], ['normal.elf'])
+        finally:
+            junction.rmdir()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows symbolic links')
+    def test_windows_symlink_is_not_followed(self):
+        self.write('normal.elf', elf_header())
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'secret').write_bytes(b'secret')
+        link = self.root / 'link'
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            if error.winerror == 1314:
+                self.skipTest('Windows symbolic link privilege unavailable')
+            raise
+        try:
+            _, report = self.scan(1, extra=('--vfs-path', '/link/secret'))
+            self.assertEqual([f['path'] for f in report['files']], ['normal.elf'])
+        finally:
+            link.unlink()
 
     def test_phase4_explicit_boot_request_fails_closed(self):
         self.write('SceShellUI.synthetic.elf', analyzed_elf())
@@ -753,11 +803,11 @@ class ScannerTests(unittest.TestCase):
         _, report = self.scan(extra=('--boot-diagnostic', '--text-report', str(text_output),
                                      '--mount', '/system=.', '--vfs-path',
                                      '/system/SceShellCore.synthetic.elf'))
-        text = text_output.read_text()
+        text = text_output.read_text(encoding="utf-8")
         self.assertIn('PS4 Firmware 9.00 Boot Diagnostic', text)
         self.assertIn('partially_implemented', text)
         self.assertNotIn(str(self.root), text)
-        self.assertNotIn(str(self.root), self.output.read_text())
+        self.assertNotIn(str(self.root), self.output.read_text(encoding="utf-8"))
         self.assertEqual(source.read_bytes(), before)
         self.assertTrue(report['services']['complete'])
 

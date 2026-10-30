@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 cmake_minimum_required(VERSION 3.24)
 project(PiStationFirmware900 LANGUAGES CXX)
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
 
 find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
 set(SHADPS4_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
@@ -20,7 +23,13 @@ add_custom_command(OUTPUT "${SERVICE_CATALOG}"
     DEPENDS generate_service_catalog.py ${SERVICE_CATALOG_SOURCES}
     VERBATIM)
 
-add_library(firmware900_manager firmware900_manager.cpp read_only_firmware_vfs.cpp
+if(WIN32)
+    set(FIRMWARE_VFS_SOURCE read_only_firmware_vfs_win32.cpp)
+else()
+    set(FIRMWARE_VFS_SOURCE read_only_firmware_vfs.cpp)
+endif()
+
+add_library(firmware900_manager firmware900_manager.cpp ${FIRMWARE_VFS_SOURCE}
     firmware900_dependency_analyzer.cpp elf_metadata_parser.cpp firmware900_service_manager.cpp
     firmware900_boot_diagnostic.cpp firmware900_service_report.cpp "${SERVICE_CATALOG}")
 target_compile_features(firmware900_manager PUBLIC cxx_std_23)
@@ -39,6 +48,11 @@ target_link_libraries(pistation-firmware900 PRIVATE firmware900_manager)
 option(PISTATION_ENABLE_TESTS "Test offline firmware diagnostics with synthetic files" ON)
 if(PISTATION_ENABLE_TESTS)
     enable_testing()
+    if(WIN32)
+        add_executable(firmware900_win32_vfs_test tests/test_win32_vfs.cpp)
+        target_link_libraries(firmware900_win32_vfs_test PRIVATE firmware900_manager)
+        add_test(NAME firmware900_win32_vfs COMMAND firmware900_win32_vfs_test)
+    endif()
     add_test(NAME firmware900_scanner
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scanner.py"
             --scanner "$<TARGET_FILE:pistation-firmware900>")

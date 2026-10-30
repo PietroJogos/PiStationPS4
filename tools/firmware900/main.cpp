@@ -4,13 +4,18 @@
 #include "firmware900_service_report.h"
 #include "read_only_firmware_vfs.h"
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <charconv>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
 
-int main(int argc, char* argv[]) {
+int Run(int argc, char* argv[]) {
     using PiStation::Firmware900Manager;
     try {
         std::filesystem::path directory;
@@ -84,7 +89,9 @@ int main(int argc, char* argv[]) {
                         throw std::runtime_error("VFS mount syntax is /guest=relative_host");
                     }
                     vfs.Mount(mount.substr(0, separator),
-                              std::filesystem::path{mount.substr(separator + 1)});
+                              std::filesystem::path{std::u8string(
+                                  mount.begin() + static_cast<std::ptrdiff_t>(separator + 1),
+                                  mount.end())});
                     report.diagnostics.push_back({"VFS", "read-only mapping configured",
                                                   "mount_readonly", mount.substr(0, separator),
                                                   "configured"});
@@ -156,3 +163,51 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t* argv[]) {
+    const auto old_page = GetConsoleOutputCP();
+    DWORD mode{};
+    const bool console = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) != 0;
+    if (console) {
+        SetConsoleOutputCP(CP_UTF8);
+    }
+    std::vector<std::string> arguments;
+    std::vector<char*> pointers;
+    for (int i = 0; i < argc; ++i) {
+        const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, nullptr,
+                                               0, nullptr, nullptr);
+        if (!length) {
+            if (console) {
+                SetConsoleOutputCP(old_page);
+            }
+            return 2;
+        }
+        std::string value(static_cast<std::size_t>(length), '\0');
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, value.data(), length,
+                                 nullptr, nullptr)) {
+            if (console) {
+                SetConsoleOutputCP(old_page);
+            }
+            return 2;
+        }
+        value.pop_back();
+        arguments.push_back(std::move(value));
+    }
+    for (auto& value : arguments) {
+        pointers.push_back(value.data());
+    }
+    pointers.push_back(nullptr);
+    const int result = Run(argc, pointers.data());
+    std::cout.flush();
+    std::cerr.flush();
+    if (console) {
+        SetConsoleOutputCP(old_page);
+    }
+    return result;
+}
+#else
+int main(int argc, char* argv[]) {
+    return Run(argc, argv);
+}
+#endif
