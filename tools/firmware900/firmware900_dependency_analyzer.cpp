@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "firmware900_dependency_analyzer.h"
+#include "source_service_catalog.h"
 
 #include <algorithm>
 #include <map>
@@ -29,9 +30,16 @@ bool NameMatches(const std::string& provided, const std::string& wanted) {
 void Firmware900DependencyAnalyzer::Analyze(ScanReport& report,
                                             const HleLookup& registered_hle) const {
     auto& analysis = report.analysis;
+    report.error_count -= std::min(report.error_count, analysis.hle_query_failures);
+    std::erase_if(report.diagnostics, [](const auto& event) {
+        return event.operation == "match_import" || event.operation == "match_module_metadata" ||
+               event.operation == "query_hle_registry" || event.operation == "inspect_registry" ||
+               event.operation == "inspect_inventory";
+    });
     analysis = {};
+    analysis.performed = true;
     analysis.complete = report.complete;
-    analysis.hle_registry_checked = static_cast<bool>(registered_hle);
+    analysis.hle_registry_connected = static_cast<bool>(registered_hle);
     std::map<std::string, std::vector<std::string>> adjacency;
     std::map<std::string, std::set<std::string>> direct_providers;
     using SymbolKey = std::tuple<std::string, std::string, std::string>;
@@ -186,23 +194,33 @@ void Firmware900DependencyAnalyzer::Analyze(ScanReport& report,
                                         {}};
             bool hle_registered{};
             bool hle_error{};
-            if (registered_hle) {
+            const bool supported_type = symbol.type == 0 || symbol.type == 1 || symbol.type == 2;
+            const bool valid_qualification = symbol.qualified
+                                                 ? !symbol.library.empty() && !symbol.module.empty()
+                                                 : symbol.name.find('#') == std::string::npos;
+            const bool valid_nid = !symbol.qualified || ValidNidSyntax(symbol.name);
+            if (registered_hle && supported_type && valid_qualification && valid_nid) {
+                analysis.hle_registry_checked = true;
+                ++analysis.hle_query_count;
                 try {
                     hle_registered = registered_hle(symbol);
-                } catch (const std::exception&) {
+                } catch (...) {
                     hle_error = true;
                     analysis.complete = false;
                     ++report.error_count;
+                    ++analysis.hle_query_failures;
                     Event(report, "ERROR", "query_hle_registry", from + ":" + symbol.name,
                           "registry_query_failed");
                 }
             }
             if (hle_error) {
                 resolution.status = "hle_registry_error";
-            } else if (symbol.type != 0 && symbol.type != 1 && symbol.type != 2) {
+            } else if (!supported_type) {
                 resolution.status = "unsupported_symbol_type";
-            } else if (!symbol.qualified && symbol.name.find('#') != std::string::npos) {
+            } else if (!valid_qualification) {
                 resolution.status = "unverified_symbol_qualification";
+            } else if (!valid_nid) {
+                resolution.status = "invalid_nid_syntax";
             } else if (hle_registered) {
                 resolution.status = "hle_registered_functionality_unknown";
             } else {
@@ -237,12 +255,22 @@ void Firmware900DependencyAnalyzer::Analyze(ScanReport& report,
             }
             Event(report, resolution.status.starts_with("hle_") ? "HLE" : "LLE", "match_import",
                   from + ":" + symbol.name, resolution.status);
+            report.diagnostics.back().service =
+                ServiceEvent{from,
+                             symbol.library,
+                             symbol.module,
+                             {},
+                             symbol.qualified ? symbol.name : std::string{},
+                             resolution.status,
+                             std::nullopt,
+                             "no_guest_call"};
             analysis.imports.push_back(std::move(resolution));
         }
     }
     Event(report, "HLE", "inspect_registry", {},
-          registered_hle ? "live_registry_queried_implementation_unknown"
-                         : "registry_not_connected_runtime_unknown");
+          !registered_hle                 ? "registry_not_connected_runtime_unknown"
+          : analysis.hle_query_count != 0 ? "live_registry_queried_implementation_unknown"
+                                          : "registry_connected_no_eligible_imports");
     Event(report, "LLE", "inspect_inventory", {}, "metadata_only_no_modules_loaded");
 }
 

@@ -474,12 +474,12 @@ class ScannerTests(unittest.TestCase):
     def test_phase2_sce_qualified_ids_match_metadata_names(self):
         self.write('shell', analyzed_elf(sce=True, module='shell', exported_library=None,
                    imported_module='libExampleModule', imported_library='libExample',
-                   symbols=[('syntheticNid#C#D', True, 2, False)]))
+                   symbols=[('exampleNidA#C#D', True, 2, False)]))
         self.write('provider.sprx', analyzed_elf(sce=True,
-                   symbols=[('syntheticNid#F#H', False, 2, False)]))
+                   symbols=[('exampleNidA#F#H', False, 2, False)]))
         _, report = self.scan()
         symbol = report['analysis']['imports'][0]
-        self.assertEqual(symbol['name'], 'syntheticNid')
+        self.assertEqual(symbol['name'], 'exampleNidA')
         self.assertEqual(symbol['library'], 'libExample')
         self.assertEqual(symbol['module'], 'libExampleModule')
         self.assertEqual(symbol['status'], 'matched_lle_export_not_loaded')
@@ -487,9 +487,9 @@ class ScannerTests(unittest.TestCase):
     def test_phase2_sce_version_difference(self):
         self.write('shell', analyzed_elf(sce=True, module='shell', exported_library=None,
                    imported_module='libExampleModule', imported_library='libExample',
-                   symbols=[('syntheticNid#C#D', True, 2, False)]))
+                   symbols=[('exampleNidA#C#D', True, 2, False)]))
         self.write('provider.sprx', analyzed_elf(sce=True, library_version=2,
-                   symbols=[('syntheticNid#F#H', False, 2, False)]))
+                   symbols=[('exampleNidA#F#H', False, 2, False)]))
         _, report = self.scan()
         self.assertIn('version_difference_requires_review', [e['status'] for e in report['analysis']['edges']])
         self.assertNotEqual(report['analysis']['imports'][0]['status'], 'matched_lle_export_not_loaded')
@@ -554,7 +554,7 @@ class ScannerTests(unittest.TestCase):
         self.assertIn('missing_from_inventory', text.read_text())
         self.assertNotIn(str(self.root), text.read_text())
         self.assertNotIn(str(self.root), self.output.read_text())
-        self.assertEqual(report['schema_version'], 2)
+        self.assertEqual(report['schema_version'], 3)
 
     def test_phase2_text_report_cannot_overwrite_input(self):
         file = self.write('file', b'keep me')
@@ -598,7 +598,7 @@ class ScannerTests(unittest.TestCase):
 
     def test_phase2_bad_sce_qualification_is_not_resolved(self):
         self.write('shell', analyzed_elf(sce=True, module='shell', imported_module='libExampleModule',
-                   imported_library='libExample', symbols=[('syntheticNid#Z#Z', True, 2, False)]))
+                   imported_library='libExample', symbols=[('exampleNidA#Z#Z', True, 2, False)]))
         _, report = self.scan()
         self.assertEqual(report['analysis']['imports'][0]['status'], 'unverified_symbol_qualification')
 
@@ -617,6 +617,158 @@ class ScannerTests(unittest.TestCase):
     def test_phase2_vfs_oversized_guest_path_is_rejected(self):
         self.write('normal', b'data')
         self.scan(1, extra=('--vfs-path', '/' + 'x' * 4096))
+
+    def service_input(self, nid, library, module):
+        self.write('SceShellCore.synthetic.elf', analyzed_elf(
+            sce=True, module='syntheticShell', exported_library=None,
+            imported_library=library, imported_module=module,
+            symbols=[(nid + '#C#D', True, 2, False)]))
+
+    def test_phase3_services_run_without_boot_mode(self):
+        self.write('image', analyzed_elf())
+        _, report = self.scan()
+        self.assertTrue(report['services']['performed'])
+        self.assertFalse(report['boot_diagnostic']['performed'])
+        self.assertFalse(report['services']['source_catalog']['runtime_registry'])
+        self.assertFalse(report['services']['live_hle_registry_checked'])
+        self.assertGreater(report['services']['source_catalog']['entries'], 0)
+        self.assertEqual(len(report['services']['source_catalog']['digest_sha256']), 64)
+
+    def test_phase3_shellcore_source_stub_is_partial(self):
+        self.service_input('Psl9mfs3duM', 'libSceUserServiceForShellCore', 'libSceUserService')
+        result, report = self.scan(extra=('--boot-diagnostic',))
+        requirement = report['services']['requirements'][0]
+        self.assertEqual(requirement['classification'], 'partially_implemented')
+        self.assertEqual(requirement['function_names'], ['sceUserServiceInitializeForShellCore'])
+        self.assertFalse(requirement['function_called'])
+        self.assertIsNone(requirement['return_code'])
+        self.assertTrue(any('userservice.cpp:' in source for source in requirement['source_evidence']))
+        events = [event for event in report['diagnostics'] if event['service']]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['category'], 'USERSERVICE')
+        self.assertEqual(events[0]['service']['requester'], 'SceShellCore.synthetic.elf')
+        self.assertIsNone(events[0]['service']['return_code'])
+        self.assertIn('[USERSERVICE]', result.stdout)
+        self.assertIn('service_source_contains_stub_marker', report['boot_diagnostic']['images'][0]['blockers'])
+
+    def test_phase3_source_registration_is_not_functionality(self):
+        self.service_input('QBi7HCK03hw', 'libkernel', 'libkernel')
+        _, report = self.scan()
+        requirement = report['services']['requirements'][0]
+        self.assertEqual(requirement['function_names'], ['sceKernelClockGettime'])
+        self.assertEqual(requirement['classification'], 'unknown_or_unverified')
+        self.assertEqual(report['services']['classification_counts']['implemented_and_tested'], 0)
+
+    def test_phase3_ipc_stub_is_identified(self):
+        self.service_input('HIwEvx4kf6o', 'libSceAppMessaging', 'libSceSystemService')
+        result, report = self.scan()
+        self.assertIn('[IPC]', result.stdout)
+        self.assertEqual(report['services']['requirements'][0]['classification'], 'partially_implemented')
+
+    def test_phase3_wrong_library_identity_is_not_source_match(self):
+        self.service_input('Psl9mfs3duM', 'wrongLibrary', 'libSceUserService')
+        _, report = self.scan()
+        self.assertEqual(report['services']['requirements'][0]['source_evidence'], [])
+        self.assertEqual(report['services']['requirements'][0]['classification'], 'unknown_or_unverified')
+
+    def test_phase3_unknown_import_does_not_prove_global_absence(self):
+        self.service_input('UnknownNidA', 'libUnknown', 'libUnknown')
+        _, report = self.scan()
+        requirement = report['services']['requirements'][0]
+        self.assertEqual(requirement['classification'], 'unknown_or_unverified')
+        self.assertEqual(requirement['nid_validation'], 'syntax_valid_identity_not_authenticated')
+
+    def test_phase3_invalid_nid_length_is_rejected(self):
+        self.service_input('short', 'libkernel', 'libkernel')
+        _, report = self.scan()
+        self.assertEqual(report['analysis']['imports'][0]['status'], 'invalid_nid_syntax')
+        self.assertEqual(report['services']['requirements'][0]['source_evidence'], [])
+
+    def test_phase3_invalid_nid_alphabet_is_rejected(self):
+        self.service_input('UnknownNid/', 'libkernel', 'libkernel')
+        _, report = self.scan()
+        self.assertEqual(report['services']['requirements'][0]['nid_validation'], 'invalid_nid_syntax')
+
+    def test_phase3_plain_elf_import_is_not_misclassified_as_nid(self):
+        self.write('plain', analyzed_elf(symbols=[('plain_function', True, 2, False)]))
+        _, report = self.scan()
+        self.assertEqual(report['services']['requirements'][0]['nid_validation'],
+                         'not_applicable_unqualified_symbol')
+
+    def test_phase3_lle_export_is_available_metadata_only(self):
+        self.write('SceShellUI.synthetic.elf', analyzed_elf(
+            needed=['provider.sprx'], symbols=[('function', True, 2, False)]))
+        self.write('provider.sprx', analyzed_elf(symbols=[('function', False, 2, False)]))
+        _, report = self.scan(extra=('--boot-diagnostic',))
+        requirement = report['services']['requirements'][0]
+        self.assertEqual(requirement['classification'], 'available_by_lle_metadata')
+        self.assertEqual(requirement['provider'], 'provider.sprx')
+        self.assertFalse(report['boot_attempted'])
+        self.assertFalse(report['boot_diagnostic']['boot_allowed'])
+
+    def test_phase3_boot_plan_memory_tls_and_safe_stop(self):
+        self.write('SceShellUI.synthetic.elf', analyzed_elf(tls=True))
+        result, report = self.scan(extra=('--boot-diagnostic',))
+        boot = report['boot_diagnostic']
+        self.assertEqual(boot['state'], 'stopped_safely_without_execution')
+        self.assertEqual(boot['module_start_order'], 'not_determined')
+        image = boot['images'][0]
+        self.assertEqual(image['entry'], 0x400180)
+        self.assertEqual(image['segment_bytes'], 0x1800)
+        self.assertEqual(image['minimum_page_bytes'], 16384)
+        self.assertEqual(image['tls_bytes'], 16)
+        self.assertIn('guest_tls_not_allocated', image['blockers'])
+        self.assertIn('ps4_process_parameters_missing', image['blockers'])
+        self.assertIn('SceShellCore_not_identified_even_by_filename', boot['blockers'])
+        self.assertIn('[BOOT]', result.stdout)
+        self.assertIn('[PROCESS]', result.stdout)
+
+    def test_phase3_protected_self_never_becomes_bootable(self):
+        self.write('SceShellCore.self', self_container(flags=2))
+        _, report = self.scan(extra=('--boot-diagnostic',))
+        image = report['boot_diagnostic']['images'][0]
+        self.assertIn('self_payload_unavailable_for_analysis', image['blockers'])
+        self.assertEqual(image['memory_estimate_status'], 'not_inspected')
+        self.assertFalse(report['boot_attempted'])
+
+    def test_phase3_invalid_input_still_generates_stopped_diagnostic(self):
+        _, report = self.scan(1, root=self.base / 'missing', extra=('--boot-diagnostic',))
+        self.assertIn('input_or_analysis_incomplete', report['boot_diagnostic']['blockers'])
+        self.assertEqual(report['boot_diagnostic']['state'], 'stopped_safely_without_execution')
+
+    def test_phase3_report_text_redaction_and_readonly_mount(self):
+        self.service_input('Psl9mfs3duM', 'libSceUserServiceForShellCore', 'libSceUserService')
+        source = self.root / 'SceShellCore.synthetic.elf'
+        before = source.read_bytes()
+        text_output = self.base / 'boot.txt'
+        _, report = self.scan(extra=('--boot-diagnostic', '--text-report', str(text_output),
+                                     '--mount', '/system=.', '--vfs-path',
+                                     '/system/SceShellCore.synthetic.elf'))
+        text = text_output.read_text()
+        self.assertIn('PS4 Firmware 9.00 Boot Diagnostic', text)
+        self.assertIn('partially_implemented', text)
+        self.assertNotIn(str(self.root), text)
+        self.assertNotIn(str(self.root), self.output.read_text())
+        self.assertEqual(source.read_bytes(), before)
+        self.assertTrue(report['services']['complete'])
+
+    def test_phase3_failed_mount_marks_service_analysis_incomplete(self):
+        self.write('image', analyzed_elf())
+        _, report = self.scan(1, extra=('--boot-diagnostic', '--mount', '/system=../outside'))
+        self.assertFalse(report['services']['complete'])
+        self.assertIn('input_or_analysis_incomplete', report['boot_diagnostic']['blockers'])
+
+    def test_phase3_log_identity_preserves_same_nid_in_different_libraries(self):
+        data = analyzed_elf(sce=True, module='shell', exported_library=None,
+                            imported_module='libSceSystemService', imported_library='libSceAppMessaging',
+                            symbols=[('HIwEvx4kf6o#C#D', True, 2, False),
+                                     ('HIwEvx4kf6o', True, 2, False)])
+        self.write('SceShellUI.synthetic.elf', data)
+        _, report = self.scan()
+        events = [event['service'] for event in report['diagnostics'] if event['service']]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]['library'], 'libSceAppMessaging')
+        self.assertEqual(events[1]['library'], '')
 
 
 if __name__ == '__main__':
