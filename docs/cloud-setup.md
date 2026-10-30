@@ -1,5 +1,10 @@
 # PiStation PS4 — configuração do ambiente, Etapa 1
 
+Relatório histórico da preparação anterior. A implementação posterior e o estado
+atual da branch `feature/dashboard-900` estão em [PHASE_01.md](pistation/PHASE_01.md).
+O script `build.sh` agora usa Debug por padrão; `PISTATION_BUILD_TYPE=Release`
+reproduz a configuração Release descrita abaixo.
+
 Data: 30/10/2026. Trabalho limitado à preparação; Etapas 2–6 não foram iniciadas.
 
 ## Repositório e referência
