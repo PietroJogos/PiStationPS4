@@ -3,14 +3,16 @@ name: PiStation firmware diagnostics
 
 on:
   push:
-    branches: [feature/dashboard-900]
+    branches: [feature/dashboard-900, feature/dashboard-900-phase2]
     paths:
       - 'tools/firmware900/**'
+      - 'src/core/loader/elf*.h'
       - 'scripts/cloud/firmware900-check.sh'
       - '.github/workflows/pistation-firmware900.yml'
   pull_request:
     paths:
       - 'tools/firmware900/**'
+      - 'src/core/loader/elf*.h'
       - 'scripts/cloud/firmware900-check.sh'
       - '.github/workflows/pistation-firmware900.yml'
 
