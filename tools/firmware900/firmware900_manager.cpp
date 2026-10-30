@@ -2,7 +2,10 @@
 #include "core/loader/elf_types.h"
 #include "elf_metadata_parser.h"
 #include "firmware900_binary.h"
+#include "firmware900_dependency_analyzer.h"
 #include "firmware900_manager.h"
+#include "firmware900_service_manager.h"
+#include "firmware900_service_report.h"
 #include "read_only_firmware_vfs.h"
 
 #include <algorithm>
@@ -355,6 +358,15 @@ ScanReport Firmware900Manager::Scan(const std::filesystem::path& directory,
     return report;
 }
 
+void Firmware900Manager::DiagnoseServices(ScanReport& report, const HleLookup& registered_hle) {
+    report.boot = {};
+    std::erase_if(report.diagnostics, [](const auto& event) {
+        return event.operation == "plan_boot" || event.operation == "plan_process";
+    });
+    Firmware900DependencyAnalyzer{}.Analyze(report, registered_hle);
+    Firmware900ServiceManager{}.Analyze(report);
+}
+
 void Firmware900Manager::WriteReport(const ScanReport& report,
                                      const std::filesystem::path& output) {
     const auto resolved = std::filesystem::weakly_canonical(output);
@@ -366,7 +378,7 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
         throw std::runtime_error("cannot create report; parent must exist and output must be new");
     }
     out << std::boolalpha
-        << "{\n\"schema_version\":2,\"mode\":\"Firmware 9.00 Dashboard — Experimental\","
+        << "{\n\"schema_version\":3,\"mode\":\"Firmware 9.00 Dashboard — Experimental\","
         << "\"firmware_version_verified\":false,\"boot_attempted\":false,"
         << "\"symbol_resolution\":\"not_evaluated\",\"root\":\"<user-selected-directory>\""
         << ",\"input_valid\":" << report.input_valid << ",\"scan_complete\":" << report.complete
@@ -467,8 +479,12 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
         StringArray(out, file.notes);
         out << '}';
     }
-    out << "\n],\"analysis\":{\"complete\":" << report.analysis.complete
-        << ",\"hle_registry_checked\":" << report.analysis.hle_registry_checked << ",\"edges\":[";
+    out << "\n],\"analysis\":{\"performed\":" << report.analysis.performed
+        << ",\"complete\":" << report.analysis.complete
+        << ",\"hle_registry_connected\":" << report.analysis.hle_registry_connected
+        << ",\"hle_registry_checked\":" << report.analysis.hle_registry_checked
+        << ",\"hle_query_count\":" << report.analysis.hle_query_count
+        << ",\"hle_query_failures\":" << report.analysis.hle_query_failures << ",\"edges\":[";
     first = true;
     for (const auto& edge : report.analysis.edges) {
         if (!std::exchange(first, false)) {
@@ -500,7 +516,9 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
         }
         StringArray(out, cycle);
     }
-    out << "]},\"diagnostics\":[";
+    out << "]}";
+    WriteServiceJson(out, report);
+    out << ",\"diagnostics\":[";
     first = true;
     for (const auto& diagnostic : report.diagnostics) {
         if (!std::exchange(first, false)) {
@@ -510,7 +528,13 @@ void Firmware900Manager::WriteReport(const ScanReport& report,
             << ",\"message\":" << JsonString(diagnostic.message)
             << ",\"operation\":" << JsonString(diagnostic.operation)
             << ",\"related\":" << JsonString(diagnostic.related)
-            << ",\"result\":" << JsonString(diagnostic.result) << '}';
+            << ",\"result\":" << JsonString(diagnostic.result) << ",\"service\":";
+        if (diagnostic.service) {
+            WriteServiceEventJson(out, *diagnostic.service);
+        } else {
+            out << "null";
+        }
+        out << '}';
     }
     out << "]}\n";
     out.close();
@@ -550,11 +574,16 @@ void Firmware900Manager::WriteTextReport(const ScanReport& report,
         StringArray(out, cycle);
         out << '\n';
     }
+    WriteServiceText(out, report);
     Emit(report, [&](const Diagnostic& diagnostic) {
         out << '[' << diagnostic.category << "] operation=" << JsonString(diagnostic.operation)
             << " related=" << JsonString(diagnostic.related)
-            << " result=" << JsonString(diagnostic.result) << ' ' << JsonString(diagnostic.message)
-            << '\n';
+            << " result=" << JsonString(diagnostic.result) << ' ' << JsonString(diagnostic.message);
+        if (diagnostic.service) {
+            out << " service=";
+            WriteServiceEventJson(out, *diagnostic.service);
+        }
+        out << '\n';
     });
     out.close();
     if (!out) {

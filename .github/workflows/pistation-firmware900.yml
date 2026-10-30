@@ -3,16 +3,20 @@ name: PiStation firmware diagnostics
 
 on:
   push:
-    branches: [feature/dashboard-900, feature/dashboard-900-phase2]
+    branches: [feature/dashboard-900, feature/dashboard-900-phase2, feature/dashboard-900-phase3]
     paths:
       - 'tools/firmware900/**'
       - 'src/core/loader/elf*.h'
+      - 'src/core/loader/symbols_resolver.*'
+      - 'src/core/libraries/**'
       - 'scripts/cloud/firmware900-check.sh'
       - '.github/workflows/pistation-firmware900.yml'
   pull_request:
     paths:
       - 'tools/firmware900/**'
       - 'src/core/loader/elf*.h'
+      - 'src/core/loader/symbols_resolver.*'
+      - 'src/core/libraries/**'
       - 'scripts/cloud/firmware900-check.sh'
       - '.github/workflows/pistation-firmware900.yml'
 
@@ -24,18 +28,20 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+      - name: Prepare fmt headers for native resolver subset
+        run: git submodule update --init externals/fmt
       - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y g++-14 cmake ninja-build python3
       - name: Build and test Debug diagnostics
         run: |
-          cmake -S tools/firmware900 -B build/scanner -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14
+          cmake -S tools/firmware900 -B build/scanner -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14 -DPISTATION_NATIVE_REGISTRY_TESTS=ON
           cmake --build build/scanner --parallel 2
           ctest --test-dir build/scanner --output-on-failure
           build/scanner/pistation-firmware900 --help
       - name: Test with address and undefined behavior sanitizers
         run: |
-          cmake -S tools/firmware900 -B build/scanner-sanitized -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14 '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
+          cmake -S tools/firmware900 -B build/scanner-sanitized -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14 -DPISTATION_NATIVE_REGISTRY_TESTS=ON '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
           cmake --build build/scanner-sanitized --parallel 2
           UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/scanner-sanitized --output-on-failure

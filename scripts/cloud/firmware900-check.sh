@@ -11,6 +11,7 @@ build_dir="$PISTATION_ENV_DIR/build/firmware900"
 mkdir -p "$PISTATION_ENV_DIR/logs"
 cmake -S "$PISTATION_ROOT/tools/firmware900" -B "$build_dir" -G Ninja \
     -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_BUILD_TYPE=Debug \
+    "-DPISTATION_NATIVE_REGISTRY_TESTS=${PISTATION_NATIVE_REGISTRY_TESTS:-OFF}" \
     -DCMAKE_SYSROOT="$PISTATION_PREFIX" \
     "-DCMAKE_CXX_FLAGS=--gcc-toolchain=$PISTATION_PREFIX/usr" \
     2>&1 | tee "$PISTATION_ENV_DIR/logs/scanner-configure.log"
