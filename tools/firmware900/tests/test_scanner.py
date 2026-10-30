@@ -511,7 +511,8 @@ class ScannerTests(unittest.TestCase):
 
     def test_phase2_unknown_relocation_recorded_without_application(self):
         self.write('unknown', analyzed_elf(relocations=[(0x400180, 999, 0, 0)]))
-        _, report = self.scan()
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'unsupported_metadata')
         self.assertEqual(report['files'][0]['elf']['relocation_types'], {'999': 1})
         self.assertFalse(report['boot_attempted'])
 
@@ -667,6 +668,137 @@ class ScannerTests(unittest.TestCase):
             self.assertEqual([f['path'] for f in report['files']], ['normal.elf'])
         finally:
             link.unlink()
+
+    def patch_dynamic(self, data, replacements):
+        entries = []
+        offset = 0x200
+        while True:
+            tag, value = struct.unpack_from('<QQ', data, offset)
+            if not tag:
+                break
+            entries.append((tag, replacements.pop(tag, value)))
+            offset += 16
+        entries.extend(replacements.items())
+        entries.append((0, 0))
+        raw = b''.join(struct.pack('<QQ', *entry) for entry in entries)
+        data[0x200:0x200 + len(raw)] = raw
+        struct.pack_into('<QQ', data, 120 + 32, len(raw), len(raw))
+        return data
+
+    def test_parser_sce_relro_is_a_mapped_relocation_destination(self):
+        data = analyzed_elf(relocations=[(0x900008, 8, 0, 0)], tls=True)
+        struct.pack_into('<IIQQQQQQ', data, 176, 0x61000010, 4, 0x1600,
+                         0x900000, 0, 0x100, 0x200, 1)
+        self.write('system/vsh/SceShellCore.elf', data)
+        _, report = self.scan(extra=('--boot-diagnostic',))
+        file = report['files'][0]
+        self.assertEqual(file['status'], 'metadata_validated')
+        self.assertEqual(file['elf']['relocation_types'], {'8': 1})
+        self.assertEqual(file['shell_role'], 'SceShellCore_name_candidate')
+        self.assertEqual(report['boot_diagnostic']['images'][0]['load_segments'], 2)
+
+    def test_parser_relro_bss_target_uses_memory_size(self):
+        data = analyzed_elf(relocations=[(0x900180, 8, 0, 0)], tls=True)
+        struct.pack_into('<IIQQQQQQ', data, 176, 0x61000010, 4, 0x1600,
+                         0x900000, 0, 0x100, 0x200, 1)
+        self.write('library.sprx', data)
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['status'], 'metadata_validated')
+
+    def test_parser_file_offset_cannot_replace_relocation_virtual_address(self):
+        data = analyzed_elf(relocations=[(0x1608, 8, 0, 0)], tls=True)
+        struct.pack_into('<IIQQQQQQ', data, 176, 0x61000010, 4, 0x1600,
+                         0x900000, 0, 0x100, 0x200, 1)
+        self.write('invalid', data)
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'invalid_or_unreadable')
+
+    def test_parser_sce_relocation_table_offset_is_not_target_base(self):
+        data = analyzed_elf(sce=True)
+        data[0x1500:0x1518] = struct.pack('<QQq', 0x400180, 8, 0)
+        self.patch_dynamic(data, {0x6100002f: 0x500, 0x61000031: 24, 0x61000033: 24})
+        self.write('library.sprx', data)
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['elf']['relocation_types'], {'8': 1})
+
+    def test_parser_none_relocation_ignores_offset_and_symbol(self):
+        self.write('image', analyzed_elf(relocations=[(2**64-1, 0, 9999, 0)]))
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['elf']['relocation_types'], {'0': 1})
+
+    def test_parser_relocation_width_is_checked_at_segment_end(self):
+        self.write('valid', analyzed_elf(relocations=[(0x4017fc, 10, 0, 0)]))
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['status'], 'metadata_validated')
+
+    def test_parser_64bit_relocation_cannot_overrun_segment(self):
+        self.write('invalid', analyzed_elf(relocations=[(0x4017fc, 1, 0, 0)]))
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'invalid_or_unreadable')
+        self.assertIn('width=8', report['files'][0]['notes'][-1])
+
+    def test_parser_unknown_relocation_is_unsupported_not_corrupt(self):
+        self.write('library.sprx', analyzed_elf(needed=['dependency.sprx'],
+                   relocations=[(2**64-1, 999, 0, 0)]))
+        _, report = self.scan(1)
+        file = report['files'][0]
+        self.assertEqual(file['status'], 'unsupported_metadata')
+        self.assertEqual(file['dependencies'][0]['name'], 'dependency.sprx')
+        self.assertEqual(file['elf']['relocation_status'], 'unsupported_metadata')
+        self.assertFalse(report['analysis']['complete'])
+
+    def oversized_sce_table(self, symbols=False):
+        data = analyzed_elf(sce=True, needed=['dependency.sprx'])
+        data.extend(bytes(0x2000 + 4097 * 24 - len(data)))
+        struct.pack_into('<QQ', data, 176 + 32, len(data)-0x1000, len(data)-0x1000)
+        if symbols:
+            self.patch_dynamic(data, {0x61000039: 0x1000, 0x6100003f: 4097 * 24})
+        else:
+            self.patch_dynamic(data, {0x6100002f: 0x1000, 0x61000031: 4097 * 24, 0x61000033: 24})
+        return data
+
+    def test_parser_large_relocation_table_is_limit_not_corrupt(self):
+        self.write('SceShellCore.elf', self.oversized_sce_table())
+        _, report = self.scan(1)
+        file = report['files'][0]
+        self.assertEqual(file['status'], 'diagnostic_limit_exceeded')
+        self.assertEqual(file['dependencies'][0]['name'], 'dependency.sprx')
+        self.assertEqual(file['elf']['relocation_status'], 'diagnostic_limit_exceeded')
+
+    def test_parser_large_symbol_table_is_limit_not_corrupt(self):
+        self.write('library.sprx', self.oversized_sce_table(symbols=True))
+        _, report = self.scan(1)
+        file = report['files'][0]
+        self.assertEqual(file['status'], 'diagnostic_limit_exceeded')
+        self.assertEqual(file['symbol_status'], 'diagnostic_limit_exceeded')
+        self.assertEqual(file['elf']['symbol_table_entries'], 4097)
+
+    def test_parser_bad_large_table_range_is_invalid_before_limit(self):
+        data = self.oversized_sce_table()
+        self.write('invalid', data[:-1])
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'invalid_or_unreadable')
+
+    def test_parser_relocation_misaligned_byte_size_is_invalid(self):
+        data = analyzed_elf(relocations=[(0x400180, 8, 0, 0)])
+        self.patch_dynamic(data, {8: 23})
+        self.write('invalid', data)
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'invalid_or_unreadable')
+
+    def test_parser_unknown_symbol_layout_is_unsupported(self):
+        data = analyzed_elf(sce=True)
+        self.patch_dynamic(data, {0x6100003b: 32})
+        self.write('library.sprx', data)
+        _, report = self.scan(1)
+        self.assertEqual(report['files'][0]['status'], 'unsupported_metadata')
+
+    def test_shellui_path_candidate_is_not_proof_of_identity(self):
+        self.write('system_ex/app/NPXS20001/eboot.bin', analyzed_elf())
+        _, report = self.scan()
+        self.assertEqual(report['files'][0]['shell_role'], 'SceShellUI_path_candidate_unverified')
+        self.assertFalse(report['firmware_version_verified'])
+        self.assertFalse(report['boot_attempted'])
 
     def test_phase4_explicit_boot_request_fails_closed(self):
         self.write('SceShellUI.synthetic.elf', analyzed_elf())

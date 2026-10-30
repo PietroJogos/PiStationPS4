@@ -21,6 +21,21 @@ constexpr std::size_t MaxEntries = 4096;
 static_assert(sizeof(elf_header) == 64 && sizeof(elf_program_header) == 56 &&
               sizeof(elf_symbol) == 24 && sizeof(elf_relocation) == 24);
 
+bool LoadSegment(std::uint64_t type) {
+    return type == PT_LOAD || type == PT_SCE_RELRO;
+}
+
+std::vector<unsigned char> Read(const Input& input, std::uint64_t offset, std::uint64_t size) {
+    if (!InRange(offset, size, input.Size())) {
+        throw std::runtime_error("ELF metadata range exceeds file");
+    }
+    if (size > 4 * 1024 * 1024) {
+        throw MetadataIssue("diagnostic_limit_exceeded", "metadata",
+                            "metadata read exceeds diagnostic byte limit=4194304");
+    }
+    return input.Read(offset, size);
+}
+
 std::string EncodeId(std::uint16_t id) {
     constexpr std::string_view alphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
@@ -34,10 +49,17 @@ std::string EncodeId(std::uint16_t id) {
 
 void Symbols(const Input& input, FileRecord& file, std::uint64_t offset, std::uint64_t count,
              std::uint64_t entry_size, const std::vector<unsigned char>& names, bool sce) {
-    if (entry_size != sizeof(elf_symbol) || count > MaxEntries) {
-        throw std::runtime_error("unsupported symbol table size or entry count");
+    file.elf->symbol_table_entries = count;
+    if (entry_size != sizeof(elf_symbol)) {
+        throw MetadataIssue("unsupported_metadata", "symbols",
+                            "unsupported symbol entry size=" + std::to_string(entry_size));
     }
-    const auto data = input.Read(offset, count * sizeof(elf_symbol));
+    if (count > MaxEntries) {
+        throw MetadataIssue("diagnostic_limit_exceeded", "symbols",
+                            "symbol count=" + std::to_string(count) +
+                                " exceeds diagnostic limit=4096; validity not determined");
+    }
+    const auto data = Read(input, offset, count * sizeof(elf_symbol));
     file.elf->symbol_table_entries = count;
     for (std::size_t i = 0; i < count; ++i) {
         const auto base = i * sizeof(elf_symbol);
@@ -51,7 +73,8 @@ void Symbols(const Input& input, FileRecord& file, std::uint64_t offset, std::ui
             continue;
         }
         if (section == 0xffff) {
-            throw std::runtime_error("extended symbol section indexes are unsupported");
+            throw MetadataIssue("unsupported_metadata", "symbols",
+                                "extended symbol section indexes are unsupported");
         }
         SymbolMetadata symbol;
         symbol.name = name;
@@ -103,18 +126,23 @@ void Sections(const Input& input, FileRecord& file, const std::vector<unsigned c
     const auto count = ReadLe(header, 60, 2);
     if (count == 0) {
         if (ReadLe(header, 40, 8) != 0) {
-            throw std::runtime_error("extended ELF section counts are unsupported");
+            throw MetadataIssue("unsupported_metadata", "sections",
+                                "extended ELF section counts are unsupported");
         }
         return;
     }
-    if (count > MaxEntries || ReadLe(header, 58, 2) != sizeof(elf_section_header)) {
-        throw std::runtime_error("unsupported section table count or size");
+    if (count > MaxEntries) {
+        throw MetadataIssue("diagnostic_limit_exceeded", "sections",
+                            "section count exceeds diagnostic limit=4096");
+    }
+    if (ReadLe(header, 58, 2) != sizeof(elf_section_header)) {
+        throw MetadataIssue("unsupported_metadata", "sections", "unsupported section entry size");
     }
     const auto offset = ReadLe(header, 40, 8);
     if (offset < sizeof(elf_header)) {
         throw std::runtime_error("section table overlaps ELF header");
     }
-    const auto sections = input.Read(offset, count * sizeof(elf_section_header));
+    const auto sections = Read(input, offset, count * sizeof(elf_section_header));
     for (std::size_t i = 0; i < count; ++i) {
         const auto base = i * sizeof(elf_section_header);
         const auto type = ReadLe(sections, base + 4, 4);
@@ -128,15 +156,19 @@ void Sections(const Input& input, FileRecord& file, const std::vector<unsigned c
         }
         const auto link = ReadLe(sections, base + 40, 4);
         const auto entry_size = ReadLe(sections, base + 56, 8);
-        if (link >= count || entry_size != sizeof(elf_symbol) || size % entry_size != 0) {
+        if (entry_size != sizeof(elf_symbol)) {
+            throw MetadataIssue("unsupported_metadata", "symbols",
+                                "unsupported SHT_DYNSYM entry size");
+        }
+        if (link >= count || size % entry_size != 0) {
             throw std::runtime_error("invalid dynamic symbol section or linked string table");
         }
         const auto strings_base = static_cast<std::size_t>(link) * sizeof(elf_section_header);
         if (ReadLe(sections, strings_base + 4, 4) != 3) {
             throw std::runtime_error("dynamic symbols do not link to SHT_STRTAB");
         }
-        const auto names = input.Read(ReadLe(sections, strings_base + 24, 8),
-                                      ReadLe(sections, strings_base + 32, 8));
+        const auto names = Read(input, ReadLe(sections, strings_base + 24, 8),
+                                ReadLe(sections, strings_base + 32, 8));
         Symbols(input, file, start, size / entry_size, entry_size, names, false);
     }
 }
@@ -144,7 +176,7 @@ void Sections(const Input& input, FileRecord& file, const std::vector<unsigned c
 } // namespace
 
 void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
-    const auto ident = input.Read(0, 16);
+    const auto ident = Read(input, 0, 16);
     if ((ident[4] != 1 && ident[4] != 2) || (ident[5] != 1 && ident[5] != 2) || ident[6] != 1) {
         throw std::runtime_error("invalid ELF identification fields");
     }
@@ -153,7 +185,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
         file.notes.emplace_back("Only ELF64 little-endian metadata is supported.");
         return;
     }
-    const auto header = input.Read(0, sizeof(elf_header));
+    const auto header = Read(input, 0, sizeof(elf_header));
     if (ReadLe(header, 20, 4) != 1 || ReadLe(header, 52, 2) != sizeof(elf_header)) {
         throw std::runtime_error("invalid ELF version or header size");
     }
@@ -173,13 +205,16 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
     file.module_role =
         elf.type == ET_DYN || elf.type == ET_SCE_DYNAMIC ? "shared_module" : "executable_candidate";
     const auto phoff = ReadLe(header, 32, 8);
-    if (elf.program_headers > MaxEntries ||
-        (elf.program_headers &&
-         (ReadLe(header, 54, 2) != sizeof(elf_program_header) || phoff < sizeof(elf_header)))) {
+    if (elf.program_headers > MaxEntries) {
+        throw MetadataIssue("diagnostic_limit_exceeded", "segments",
+                            "program header count exceeds diagnostic limit=4096");
+    }
+    if (elf.program_headers &&
+        (ReadLe(header, 54, 2) != sizeof(elf_program_header) || phoff < sizeof(elf_header))) {
         throw std::runtime_error("invalid or unsupported ELF program header table");
     }
-    const auto ph = input.Read(elf.program_headers ? phoff : 0,
-                               elf.program_headers * sizeof(elf_program_header));
+    const auto ph = Read(input, elf.program_headers ? phoff : 0,
+                         elf.program_headers * sizeof(elf_program_header));
     std::optional<SegmentMetadata> dynamic;
     std::optional<SegmentMetadata> sce_data;
     for (std::size_t i = 0; i < elf.program_headers; ++i) {
@@ -192,12 +227,12 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
             (s.alignment && (s.alignment & (s.alignment - 1)))) {
             throw std::runtime_error("ELF segment bounds, virtual range or alignment invalid");
         }
-        if ((s.type == PT_LOAD || s.type == PT_TLS) &&
+        if ((LoadSegment(s.type) || s.type == PT_TLS) &&
             (s.memory_size < s.file_size ||
              (s.alignment > 1 && s.offset % s.alignment != s.address % s.alignment))) {
             throw std::runtime_error("ELF load/TLS sizes or alignment are inconsistent");
         }
-        if (s.type == PT_LOAD && (s.flags & 1) && elf.entry >= s.address &&
+        if (LoadSegment(s.type) && (s.flags & 1) && elf.entry >= s.address &&
             elf.entry - s.address < s.memory_size) {
             elf.entry_in_executable_segment = true;
         }
@@ -224,7 +259,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
     if (!dynamic->file_size || dynamic->file_size % sizeof(elf_dynamic)) {
         throw std::runtime_error("invalid ELF dynamic table size");
     }
-    const auto entries = input.Read(dynamic->offset, dynamic->file_size);
+    const auto entries = Read(input, dynamic->offset, dynamic->file_size);
     std::map<std::uint64_t, std::uint64_t> tags;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> identities;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> needed;
@@ -261,12 +296,14 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
         }
         if (tag == DT_NEEDED || tag == DT_SCE_NEEDED_MODULE || tag == DT_SCE_IMPORT_LIB) {
             if (needed.size() >= MaxEntries) {
-                throw std::runtime_error("dependency count exceeds diagnostic limit");
+                throw MetadataIssue("diagnostic_limit_exceeded", "dependencies",
+                                    "dependency count exceeds diagnostic limit");
             }
             needed.emplace_back(tag, value);
         } else if (tag == DT_SCE_MODULE_INFO || tag == DT_SCE_EXPORT_LIB) {
             if (identities.size() >= MaxEntries) {
-                throw std::runtime_error("module identity count exceeds diagnostic limit");
+                throw MetadataIssue("diagnostic_limit_exceeded", "identities",
+                                    "module identity count exceeds diagnostic limit");
             }
             identities.emplace_back(tag, value);
         } else if (supported_tags.contains(tag)) {
@@ -288,7 +325,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
     const auto locate = [&](std::uint64_t address, std::uint64_t size) {
         std::optional<std::uint64_t> offset;
         for (const auto& segment : elf.segments) {
-            if (segment.type == PT_LOAD && address >= segment.address &&
+            if (LoadSegment(segment.type) && address >= segment.address &&
                 InRange(address - segment.address, size, segment.file_size)) {
                 if (offset) {
                     throw std::runtime_error("ambiguous virtual metadata range");
@@ -297,7 +334,7 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
             }
         }
         if (!offset) {
-            throw std::runtime_error("metadata address has no file-backed PT_LOAD");
+            throw std::runtime_error("metadata address has no file-backed PT_LOAD/PT_SCE_RELRO");
         }
         return *offset;
     };
@@ -309,10 +346,10 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
     };
     std::vector<unsigned char> names;
     if (tags.contains(DT_SCE_STRTAB) && tags.contains(DT_SCE_STRSZ)) {
-        names = input.Read(sce_offset(tags.at(DT_SCE_STRTAB), tags.at(DT_SCE_STRSZ)),
-                           tags.at(DT_SCE_STRSZ));
+        names = Read(input, sce_offset(tags.at(DT_SCE_STRTAB), tags.at(DT_SCE_STRSZ)),
+                     tags.at(DT_SCE_STRSZ));
     } else if (tags.contains(5) && tags.contains(10)) {
-        names = input.Read(locate(tags.at(5), tags.at(10)), tags.at(10));
+        names = Read(input, locate(tags.at(5), tags.at(10)), tags.at(10));
     }
     const auto name_at = [&](std::uint64_t offset) {
         auto name = ReadString(names, offset);
@@ -371,20 +408,29 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
     if (tags.contains(DT_SCE_SYMTAB) && tags.contains(DT_SCE_SYMTABSZ)) {
         const auto size = tags.at(DT_SCE_SYMTABSZ);
         const auto entry_size = tags.contains(DT_SCE_SYMENT) ? tags.at(DT_SCE_SYMENT) : 24;
-        if (entry_size != sizeof(elf_symbol) || size % entry_size != 0) {
-            throw std::runtime_error("invalid SCE symbol table entry size");
+        if (entry_size != sizeof(elf_symbol)) {
+            throw MetadataIssue("unsupported_metadata", "symbols",
+                                "unsupported SCE symbol entry size=" + std::to_string(entry_size));
+        }
+        if (size % entry_size != 0) {
+            throw std::runtime_error("SCE symbol table byte size is not a multiple of entry size");
         }
         Symbols(input, file, sce_offset(tags.at(DT_SCE_SYMTAB), size), size / entry_size,
                 entry_size, names, true);
     } else if (tags.contains(6) && tags.contains(4)) {
-        const auto hash = input.Read(locate(tags.at(4), 8), 8);
+        const auto hash = Read(input, locate(tags.at(4), 8), 8);
         const auto buckets = ReadLe(hash, 0, 4);
         const auto count = ReadLe(hash, 4, 4);
         const auto entry_size = tags.contains(11) ? tags.at(11) : 24;
-        if (entry_size != sizeof(elf_symbol) || count > MaxEntries || buckets > MaxEntries) {
-            throw std::runtime_error("invalid ELF hash symbol count or symbol entry size");
+        if (entry_size != sizeof(elf_symbol)) {
+            throw MetadataIssue("unsupported_metadata", "symbols",
+                                "unsupported ELF symbol entry size=" + std::to_string(entry_size));
         }
         locate(tags.at(4), 8 + 4 * (buckets + count));
+        if (buckets > MaxEntries) {
+            throw MetadataIssue("diagnostic_limit_exceeded", "symbols",
+                                "ELF hash bucket count exceeds diagnostic limit=4096");
+        }
         Symbols(input, file, locate(tags.at(6), count * entry_size), count, entry_size, names,
                 false);
     } else if (tags.contains(6)) {
@@ -395,35 +441,88 @@ void AnalyzeElfMetadata(const Input& input, FileRecord& file) {
         if (!tags.contains(ptr) && !tags.contains(size_tag)) {
             return;
         }
-        if (!tags.contains(ptr) || !tags.contains(size_tag) ||
-            (tags.contains(entry_tag) && tags.at(entry_tag) != (plt ? DT_RELA : 24))) {
-            throw std::runtime_error("unsupported or incomplete relocation metadata");
+        if (!tags.contains(ptr) || !tags.contains(size_tag)) {
+            throw std::runtime_error("incomplete relocation pointer/size metadata");
+        }
+        if (tags.contains(entry_tag) && tags.at(entry_tag) != (plt ? DT_RELA : 24)) {
+            throw MetadataIssue("unsupported_metadata", "relocations",
+                                "unsupported relocation encoding/entry size; tag=" +
+                                    std::to_string(entry_tag));
         }
         const auto size = tags.at(size_tag);
-        if (size % sizeof(elf_relocation) || size / sizeof(elf_relocation) > MaxEntries) {
-            throw std::runtime_error("relocation table exceeds size/count limit");
+        if (size % sizeof(elf_relocation)) {
+            throw std::runtime_error(
+                "relocation byte size is not a multiple of ELF64 RELA entry size");
         }
-        const auto data =
-            input.Read(sce ? sce_offset(tags.at(ptr), size) : locate(tags.at(ptr), size), size);
+        const auto table_offset = sce ? sce_offset(tags.at(ptr), size) : locate(tags.at(ptr), size);
+        if (size / sizeof(elf_relocation) > MaxEntries) {
+            throw MetadataIssue(
+                "diagnostic_limit_exceeded", "relocations",
+                "relocation count=" + std::to_string(size / sizeof(elf_relocation)) +
+                    " exceeds diagnostic limit=4096; tag=" + std::to_string(ptr) +
+                    "; validity not determined");
+        }
+        const auto data = Read(input, table_offset, size);
         for (std::size_t b = 0; b < data.size(); b += sizeof(elf_relocation)) {
             const auto address = ReadLe(data, b, 8);
             const auto info = ReadLe(data, b + 8, 8);
             const auto type = static_cast<std::uint32_t>(info);
+            if (type == 0) {
+                ++elf.relocation_types[type];
+                continue;
+            }
+            std::uint64_t width{};
+            switch (type) {
+            case 1:
+            case 6:
+            case 7:
+            case 8:
+            case 16:
+            case 17:
+            case 18:
+            case 24:
+                width = 8;
+                break;
+            case 2:
+            case 4:
+            case 9:
+            case 10:
+            case 11:
+                width = 4;
+                break;
+            case 12:
+            case 13:
+                width = 2;
+                break;
+            case 14:
+            case 15:
+                width = 1;
+                break;
+            case 36:
+                width = 16;
+                break;
+            default:
+                ++elf.relocation_types[type];
+                throw MetadataIssue(
+                    "unsupported_metadata", "relocations",
+                    "relocation write width unsupported; type=" + std::to_string(type) +
+                        "; r_offset=" + std::to_string(address));
+            }
             if ((info >> 32) && file.elf->symbol_table_entries &&
                 (info >> 32) >= file.elf->symbol_table_entries) {
                 throw std::runtime_error("relocation symbol index outside symbol table");
             }
-            const bool supported = type == R_X86_64_64 || type == R_X86_64_GLOB_DAT ||
-                                   type == R_X86_64_JUMP_SLOT || type == R_X86_64_RELATIVE ||
-                                   type == R_X86_64_DTPMOD64;
-            bool mapped = type == 0;
+            bool mapped{};
             for (const auto& segment : elf.segments) {
-                mapped |=
-                    segment.type == PT_LOAD && address >= segment.address &&
-                    InRange(address - segment.address, supported ? 8 : 1, segment.memory_size);
+                mapped |= LoadSegment(segment.type) && address >= segment.address &&
+                          InRange(address - segment.address, width, segment.memory_size);
             }
             if (!mapped) {
-                throw std::runtime_error("relocation destination is outside PT_LOAD");
+                throw std::runtime_error(
+                    "relocation destination is outside PT_LOAD/PT_SCE_RELRO; tag=" +
+                    std::to_string(ptr) + "; index=" + std::to_string(b / sizeof(elf_relocation)) +
+                    "; type=" + std::to_string(type) + "; r_offset=" + std::to_string(address) +
+                    "; width=" + std::to_string(width));
             }
             ++elf.relocation_types[type];
         }
