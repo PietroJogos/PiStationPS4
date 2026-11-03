@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
+#include "core/pistation/native_boot_backend.h"
 #include "core/libraries/libs.h"
 #include "core/linker.h"
 
@@ -149,6 +151,22 @@ s32 PS4_SYSV_ABI sceKernelLoadStartModuleInternalForMono(const char* moduleFileN
     const s32 handle = LoadStartModuleFromGuestPath(moduleFileName, args, argp, pRes);
     LOG_INFO(Lib_Kernel, "[KERNEL] ForMono filename = {} -> {:#x}", moduleFileName, handle);
     return handle;
+}
+
+// Kernel IPMI multiplexer used by libSceIpmi. Its argument layout is not documented; the six
+// integer argument registers are traced and no server exists to answer, so ENOSYS is reported.
+s32 PS4_SYSV_ABI ipmimgr_call(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6) {
+    static std::atomic<u32> call_count{0};
+    const u32 index = call_count++;
+    if (index < 256) {
+        LOG_INFO(Lib_Kernel, "[IPMI] ipmimgr_call #{} args = {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                 index, a1, a2, a3, a4, a5, a6);
+        PiStation::NativeBootBackend::Instance().Record(
+            "IPMI", "ipmimgr_call",
+            fmt::format("#{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}", index, a1, a2, a3, a4, a5, a6),
+            "ENOSYS: no IPMI server is emulated");
+    }
+    return ORBIS_KERNEL_ERROR_ENOSYS;
 }
 
 s32 PS4_SYSV_ABI sceKernelStopUnloadModule(s32 handle, u64 args, const void* argp, u32 flags,
@@ -369,6 +387,7 @@ void RegisterProcess(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("959qrazPIrg", "libkernel", 1, "libkernel", sceKernelGetProcParam);
     LIB_FUNCTION("wzvqT4UqKX8", "libkernel", 1, "libkernel", sceKernelLoadStartModule);
     LIB_FUNCTION("Y1nEpkCieOY", "libkernel", 1, "libkernel", sceKernelLoadStartModuleInternalForMono);
+    LIB_FUNCTION("Hk7iHmGxB18", "libkernel", 1, "libkernel", ipmimgr_call);
     LIB_FUNCTION("QKd0qM58Qes", "libkernel", 1, "libkernel", sceKernelStopUnloadModule);
     LIB_FUNCTION("LwG8g3niqwA", "libkernel", 1, "libkernel", sceKernelDlsym);
     LIB_FUNCTION("RpQJJVKTiFM", "libkernel", 1, "libkernel", sceKernelGetModuleInfoForUnwind);
