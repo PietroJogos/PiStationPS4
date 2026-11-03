@@ -154,6 +154,13 @@ public:
         return npCommIds;
     }
 
+    void InitializeSynthetic(u32 compiled_sdk_ver) {
+        initialized = true;
+        sdk_ver = compiled_sdk_ver;
+        firmware_ver = compiled_sdk_ver & 0xFFF00000;
+        raw_firmware_ver = compiled_sdk_ver;
+    }
+
     void SetNpCommIds(std::vector<std::string> ids) {
         npCommIds = std::move(ids);
     }

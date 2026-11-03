@@ -1003,6 +1003,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/memory.h
          src/core/module.cpp
          src/core/module.h
+         src/core/pistation/native_boot_backend.cpp
+         src/core/pistation/native_boot_backend.h
          src/core/platform.h
          src/core/signals.cpp
          src/core/signals.h

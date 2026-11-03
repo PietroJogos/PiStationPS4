@@ -26,6 +26,7 @@
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/tls.h"
+#include "core/pistation/native_boot_backend.h"
 #include "ipc/ipc.h"
 
 #ifndef _WIN32
@@ -75,6 +76,12 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     // Calculate static TLS size.
     Module* module = m_modules[0].get();
+    auto& boot_backend = PiStation::NativeBootBackend::Instance();
+    boot_backend.ReachPhase(PiStation::BootPhase::FileIdentified,
+                            fmt::format("main module '{}' passed ELF validation", module->name));
+    boot_backend.ReachPhase(PiStation::BootPhase::FileLoaded,
+                            fmt::format("main module mapped at {:#x}, entry {:#x}",
+                                        module->GetBaseAddress(), module->GetEntryAddress()));
     static_tls_size = module->tls.offset = module->tls.image_size;
 
     // Map libSceLibcInternal
@@ -145,6 +152,9 @@ void Linker::Execute(const std::vector<std::string>& args) {
     }
 
     memory->SetupMemoryRegions(fmem_size, use_extended_mem1, use_extended_mem2);
+    boot_backend.ReachPhase(PiStation::BootPhase::MemoryPrepared,
+                            fmt::format("flexible memory {:#x}, {} modules loaded", fmem_size,
+                                        m_modules.size()));
 
     main_thread.Run([this, module, &args, has_libcinternal](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
@@ -213,6 +223,10 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
         // Run the game's entry function
         params.entry_addr = module->GetEntryAddress();
+        PiStation::NativeBootBackend::Instance().ReachPhase(
+            PiStation::BootPhase::EntryReached,
+            fmt::format("jumping to {:#x}; guest execution is not yet confirmed",
+                        params.entry_addr));
         RunMainEntry(&params);
     });
 }
@@ -450,6 +464,8 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         return_info->virtual_address = AeroLib::GetStub(sr.name.c_str());
         return_info->symbol.nidName = "Unknown !!!";
     }
+    PiStation::NativeBootBackend::Instance().RecordUnresolvedSymbol(
+        library->name, module->name, sr.name, return_info->symbol.nidName);
     if (library->name != "libc" && library->name != "libSceFios2") {
         LOG_WARNING(Core_Linker, "Linker: Stub resolved {} as {} (lib: {}, mod: {})", sr.name,
                     return_info->symbol.nidName, library->name, module->name);

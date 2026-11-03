@@ -22,6 +22,7 @@
 #include "core/emulator_state.h"
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
+#include "core/pistation/native_boot_backend.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
@@ -68,6 +69,8 @@ int main(int argc, char* argv[]) {
     bool bigPicture = false;
     bool sameProcess = false;
     bool append_log{};
+    std::optional<std::filesystem::path> pistationSelfTestDir;
+    std::optional<std::filesystem::path> pistationBootReportDir;
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
@@ -99,6 +102,10 @@ int main(int argc, char* argv[]) {
 #endif
 
     app.add_flag("--show-fps", showFps);
+    app.add_option("--pistation-synthetic-selftest", pistationSelfTestDir,
+                   "Run the PiStation synthetic guest ELF self-test and write reports there");
+    app.add_option("--pistation-boot-report", pistationBootReportDir,
+                   "Write PiStation native boot reports for this run to the directory");
     app.add_flag("--config-clean", configClean);
     app.add_flag("--config-global", configGlobal);
     app.add_flag("--log-append", append_log);
@@ -165,6 +172,13 @@ int main(int argc, char* argv[]) {
     if (bigPicture) {
         BigPictureMode::Launch(argv[0], sameProcess);
         return 0;
+    }
+
+    if (pistationSelfTestDir) {
+        return PiStation::RunSyntheticSelfTest(*pistationSelfTestDir);
+    }
+    if (pistationBootReportDir) {
+        PiStation::NativeBootBackend::Instance().Enable(*pistationBootReportDir);
     }
 
     // ---- Utility commands ----
