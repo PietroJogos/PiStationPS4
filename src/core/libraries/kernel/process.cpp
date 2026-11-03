@@ -99,11 +99,8 @@ void* PS4_SYSV_ABI sceKernelGetProcParam() {
     return linker->GetProcParam();
 }
 
-s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, const void* argp,
-                                          u32 flags, const void* pOpt, s32* pRes) {
-    LOG_INFO(Lib_Kernel, "called filename = {}, args = {}", moduleFileName, args);
-    ASSERT(flags == 0);
-
+static s32 LoadStartModuleFromGuestPath(const char* moduleFileName, u64 args, const void* argp,
+                                        s32* pRes) {
     auto* linker = Common::Singleton<Core::Linker>::Instance();
 
     std::string guest_path(moduleFileName);
@@ -132,6 +129,26 @@ s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, 
     }
 
     return ORBIS_KERNEL_ERROR_ENOENT;
+}
+
+s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, const void* argp,
+                                          u32 flags, const void* pOpt, s32* pRes) {
+    LOG_INFO(Lib_Kernel, "called filename = {}, args = {}", moduleFileName, args);
+    ASSERT(flags == 0);
+    return LoadStartModuleFromGuestPath(moduleFileName, args, argp, pRes);
+}
+
+s32 PS4_SYSV_ABI sceKernelLoadStartModuleInternalForMono(const char* moduleFileName, u64 args,
+                                                         const void* argp, u32 flags,
+                                                         const void* pOpt, s32* pRes) {
+    if (!moduleFileName) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    LOG_INFO(Lib_Kernel, "[KERNEL] ForMono filename = {}, args = {}, flags = {:#x}", moduleFileName,
+             args, flags);
+    const s32 handle = LoadStartModuleFromGuestPath(moduleFileName, args, argp, pRes);
+    LOG_INFO(Lib_Kernel, "[KERNEL] ForMono filename = {} -> {:#x}", moduleFileName, handle);
+    return handle;
 }
 
 s32 PS4_SYSV_ABI sceKernelStopUnloadModule(s32 handle, u64 args, const void* argp, u32 flags,
@@ -351,6 +368,7 @@ void RegisterProcess(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("g0VTBxfJyu0", "libkernel", 1, "libkernel", sceKernelGetCurrentCpu);
     LIB_FUNCTION("959qrazPIrg", "libkernel", 1, "libkernel", sceKernelGetProcParam);
     LIB_FUNCTION("wzvqT4UqKX8", "libkernel", 1, "libkernel", sceKernelLoadStartModule);
+    LIB_FUNCTION("Y1nEpkCieOY", "libkernel", 1, "libkernel", sceKernelLoadStartModuleInternalForMono);
     LIB_FUNCTION("QKd0qM58Qes", "libkernel", 1, "libkernel", sceKernelStopUnloadModule);
     LIB_FUNCTION("LwG8g3niqwA", "libkernel", 1, "libkernel", sceKernelDlsym);
     LIB_FUNCTION("RpQJJVKTiFM", "libkernel", 1, "libkernel", sceKernelGetModuleInfoForUnwind);

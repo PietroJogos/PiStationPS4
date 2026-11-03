@@ -675,6 +675,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         mnt->Mount(mount_pair.first, mount_pair.second);
     }
 
+    for (auto const& mount_pair : readOnlyMounts) {
+        LOG_INFO(Loader, "Mounting {} to {} (read-only)", mount_pair.first.string(),
+                 mount_pair.second);
+        mnt->Mount(mount_pair.first, mount_pair.second, true);
+    }
+
     if (std::filesystem::is_empty(host_font_dir) || std::filesystem::is_empty(host_font2_dir)) {
         LOG_WARNING(Loader, "No dumped system fonts, expect missing text or instability");
     }

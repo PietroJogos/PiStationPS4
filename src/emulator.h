@@ -46,6 +46,7 @@ public:
     [[noreturn]] void Relaunch(std::vector<std::string> args);
 
     const char* executableName;
+    std::vector<std::pair<std::filesystem::path, std::string>> readOnlyMounts;
     bool waitForDebuggerBeforeRun{false};
 
 private:

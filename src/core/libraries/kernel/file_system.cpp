@@ -899,6 +899,29 @@ s32 PS4_SYSV_ABI posix_access(const char* path, s32 mode) {
     return ORBIS_OK;
 }
 
+s64 PS4_SYSV_ABI posix_readlink(const char* path, char* buf, u64 bufsize) {
+    if (path == nullptr || buf == nullptr) {
+        *__Error() = POSIX_EFAULT;
+        return -1;
+    }
+    if (path[0] == ' ') {
+        *__Error() = POSIX_ENOENT;
+        return -1;
+    }
+    if (strlen(path) > 255) {
+        *__Error() = POSIX_ENAMETOOLONG;
+        return -1;
+    }
+    auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+    if (!mnt->IsDirectory(path) && !mnt->Exists(path)) {
+        *__Error() = POSIX_ENOENT;
+        return -1;
+    }
+    // Guest-visible paths are never symbolic links.
+    *__Error() = POSIX_EINVAL;
+    return -1;
+}
+
 s32 PS4_SYSV_ABI posix_chdir(const char* path) {
     LOG_ERROR(Kernel_Fs, "(STUBBED) path = {}", path ? path : "null");
     return 0;
@@ -2238,6 +2261,8 @@ void RegisterFileSystem(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("c7ZnT7V1B98", "libkernel", 1, "libkernel", posix_rmdir);
     LIB_FUNCTION("naInUjYt3so", "libkernel", 1, "libkernel", sceKernelRmdir);
     LIB_FUNCTION("8vE6Z6VEYyk", "libkernel_psmkit", 1, "libkernel", posix_access);
+    LIB_FUNCTION("8vE6Z6VEYyk", "libkernel", 1, "libkernel", posix_access);
+    LIB_FUNCTION("pd02UI9TbOA", "libkernel", 1, "libkernel", posix_readlink);
     LIB_FUNCTION("6mMQ1MSPW-Q", "libkernel", 1, "libkernel", posix_chdir);
     LIB_FUNCTION("6mMQ1MSPW-Q", "libkernel_psmkit", 1, "libkernel", posix_chdir);
     LIB_FUNCTION("DRGXpDDh8Ng", "libkernel", 1, "libkernel", posix_lstat);
