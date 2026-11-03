@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: PiStation firmware diagnostics
+
+on:
+  push:
+    branches: [feature/dashboard-900, feature/dashboard-900-phase2, feature/dashboard-900-phase3, feature/dashboard-900-phase4, fix/dashboard-900-windows-vfs]
+    paths:
+      - 'tools/firmware900/**'
+      - 'src/core/loader/elf*.h'
+      - 'src/core/loader/symbols_resolver.*'
+      - 'src/core/libraries/**'
+      - 'scripts/cloud/firmware900-check.sh'
+      - '.github/workflows/pistation-firmware900.yml'
+  pull_request:
+    paths:
+      - 'tools/firmware900/**'
+      - 'src/core/loader/elf*.h'
+      - 'src/core/loader/symbols_resolver.*'
+      - 'src/core/libraries/**'
+      - 'scripts/cloud/firmware900-check.sh'
+      - '.github/workflows/pistation-firmware900.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scanner:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare fmt headers for native resolver subset
+        run: git submodule update --init externals/fmt
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake ninja-build python3
+      - name: Build and test Debug diagnostics
+        run: |
+          cmake -S tools/firmware900 -B build/scanner -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14 -DPISTATION_NATIVE_REGISTRY_TESTS=ON
+          cmake --build build/scanner --parallel 2
+          ctest --test-dir build/scanner --output-on-failure
+          build/scanner/pistation-firmware900 --help
+      - name: Test with address and undefined behavior sanitizers
+        run: |
+          cmake -S tools/firmware900 -B build/scanner-sanitized -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-14 -DPISTATION_NATIVE_REGISTRY_TESTS=ON '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
+          cmake --build build/scanner-sanitized --parallel 2
+          UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/scanner-sanitized --output-on-failure
+
+  windows-scanner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure MSVC diagnostics
+        run: cmake -S tools/firmware900 -B build-firmware900 -DPISTATION_ENABLE_TESTS=ON
+      - name: Build Debug
+        run: cmake --build build-firmware900 --config Debug --parallel 2
+      - name: Test Debug including Win32 VFS
+        run: ctest --test-dir build-firmware900 -C Debug --output-on-failure
+      - name: Build Release
+        run: cmake --build build-firmware900 --config Release --parallel 2
+      - name: Test Release
+        run: ctest --test-dir build-firmware900 -C Release --output-on-failure
