@@ -209,7 +209,13 @@ void RunConcurrencyCheck(CheckLog& check) {
 
 void RunIpmiKernelChecks(CheckLog& check) {
     using namespace Libraries::Ipmi;
-    IpmiKernelManager kernel;
+    static const char ServiceName[] = "SyntheticService";
+    IpmiKernelManager kernel{[](u64 address) -> std::optional<std::string> {
+        if (address == reinterpret_cast<u64>(ServiceName)) {
+            return std::string{ServiceName};
+        }
+        return std::nullopt;
+    }};
     s32 result = IpmiResultUnset;
     const u64 create_args[3] = {0x1234, 0x5678, 0};
 
@@ -229,13 +235,23 @@ void RunIpmiKernelChecks(CheckLog& check) {
           kernel.Call(IpmiCreateOp, 0, &result, create_args, IpmiCreateArgsSize) == 0 &&
               result > 0 && result != first && kernel.HandleCount() == 2);
     result = IpmiResultUnset;
+    const u64 named_args[3] = {0x1234, reinterpret_cast<u64>(ServiceName), 0};
+    s32 named_result = IpmiResultUnset;
+    check("ipmi_create_records_service_name",
+          kernel.Call(IpmiCreateOp, 0, &named_result, named_args, IpmiCreateArgsSize) == 0 &&
+              kernel.ServiceNameOf(named_result) == std::string{ServiceName});
+    check("ipmi_unreadable_name_leaves_none", !kernel.ServiceNameOf(first).has_value());
+    check("ipmi_operation_names",
+          std::string{IpmiOperationName(0x310)} == "ClientImpl::disconnect" &&
+              std::string{IpmiOperationName(0x2)} == "ClientImpl::initialize (Client::create)" &&
+              IpmiOperationName(0x400) == nullptr);
     check("ipmi_unknown_op_enosys",
           kernel.Call(0x400, first, &result, create_args, 0x20) == POSIX_ENOSYS &&
               result == IpmiResultUnset);
     check("ipmi_destroy_with_args_rejected",
           kernel.Call(IpmiDestroyOp, first, &result, create_args, 8) == POSIX_EINVAL);
     check("ipmi_destroy", kernel.Call(IpmiDestroyOp, first, &result, nullptr, 0) == 0 &&
-                              result == 0 && kernel.HandleCount() == 1);
+                              result == 0 && kernel.HandleCount() == 2);
     check("ipmi_destroy_twice_ebadf",
           kernel.Call(IpmiDestroyOp, first, &result, nullptr, 0) == POSIX_EBADF);
 }
@@ -256,51 +272,64 @@ int RunIpcSelfTest(const std::filesystem::path& report_directory) {
     return check.failed == 0 ? 0 : 1;
 }
 
+namespace {
+
+bool RunRenderCycle(NativeBootBackend& backend, u32 cycle) {
+    const std::string tag = fmt::format("cycle {}", cycle);
+    auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
+    auto window = std::make_unique<Frontend::WindowSDL>(1280, 720, controllers,
+                                                        "PiStation synthetic render self-test");
+    if (!window->GetSDLWindow() || !window->IsOpen()) {
+        backend.RecordFailure("VULKAN", "window", tag + ": SDL window was not created");
+        return false;
+    }
+    g_window = window.get();
+    backend.Record("PISTATION_BOOT", "window_created", tag + ": SDL window 1280x720", "ok");
+
+    bool ok = true;
+    {
+        auto liverpool = std::make_unique<AmdGpu::Liverpool>();
+        auto presenter = std::make_unique<Vulkan::Presenter>(*window, liverpool.get());
+        backend.Record("VULKAN", "renderer_initialized",
+                       tag + ": instance, device, schedulers, swapchain and rasterizer constructed",
+                       "ok");
+        if (auto* frame = presenter->PrepareBlankFrame(false)) {
+            presenter->Present(frame, false, false);
+            backend.Record("FRAMEBUFFER", "synthetic_blank_frame_presented",
+                           tag + ": blank frame submitted to the swapchain; not guest output", "ok");
+        } else {
+            backend.RecordFailure("FRAMEBUFFER", "prepare_blank_frame", tag + ": returned null");
+            ok = false;
+        }
+        presenter.reset();
+        backend.Record("VULKAN_SHUTDOWN", "presenter_destroyed", tag, "ok");
+        liverpool.reset();
+        backend.Record("VULKAN_SHUTDOWN", "liverpool_destroyed", tag, "ok");
+    }
+    g_window = nullptr;
+    window.reset();
+    backend.Record("PISTATION_BOOT", "window_destroyed", tag, "ok");
+    return ok;
+}
+
+} // namespace
+
 int RunRenderSelfTest(const std::filesystem::path& report_directory) {
     auto& backend = NativeBootBackend::Instance();
     backend.Enable(report_directory);
     Common::ElfInfo::Instance().InitializeSynthetic(Common::ElfInfo::FW_900);
 
-    auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
-    auto window = std::make_unique<Frontend::WindowSDL>(1280, 720, controllers,
-                                                        "PiStation synthetic render self-test");
-    if (!window->GetSDLWindow() || !window->IsOpen()) {
-        backend.RecordFailure("VULKAN", "window", "SDL window was not created");
-        return 1;
-    }
-    g_window = window.get();
-    backend.Record("PISTATION_BOOT", "window_created", "SDL window 1280x720", "ok");
-
-    int exit_code = 0;
-    {
-        auto liverpool = std::make_unique<AmdGpu::Liverpool>();
-        auto presenter = std::make_unique<Vulkan::Presenter>(*window, liverpool.get());
-        backend.Record("VULKAN", "renderer_initialized",
-                       "Vulkan instance, device, schedulers, swapchain and rasterizer constructed",
-                       "ok");
-        auto* frame = presenter->PrepareBlankFrame(false);
-        if (!frame) {
-            backend.RecordFailure("FRAMEBUFFER", "prepare_blank_frame", "returned null");
-            exit_code = 1;
-        } else {
-            presenter->Present(frame, false, false);
-            backend.Record("FRAMEBUFFER", "synthetic_blank_frame_presented",
-                           "blank frame prepared and submitted to the swapchain; this is not guest "
-                           "output",
-                           "ok");
+    constexpr u32 Cycles = 2;
+    for (u32 cycle = 0; cycle < Cycles; cycle++) {
+        if (!RunRenderCycle(backend, cycle)) {
+            backend.WriteReports();
+            return 1;
         }
-        backend.Record("VULKAN", "renderer_teardown",
-                       "not performed: destroying the presenter asserts in ImGui::DestroyContext "
-                       "(viewport PlatformUserData still set); the normal runtime never destroys "
-                       "it either, so both objects are left to process exit",
-                       "unsupported");
-        static_cast<void>(presenter.release());
-        static_cast<void>(liverpool.release());
     }
-    static_cast<void>(window.release());
+    backend.Record("PISTATION_BOOT", "render_selftest", fmt::format("{} cycles completed", Cycles),
+                   "ok");
     backend.WriteReports();
-    // Renderer threads cannot be joined (see above), so leave the way the normal runtime does.
-    std::quick_exit(exit_code);
+    return 0;
 }
 
 int RunModuleLoadProbe(const std::filesystem::path& module_path,

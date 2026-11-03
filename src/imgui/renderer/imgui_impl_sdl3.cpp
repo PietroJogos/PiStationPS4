@@ -600,6 +600,10 @@ void Shutdown() {
         SDL_DestroyCursor(bd->mouse_cursors[cursor_n]);
     CloseGamepads();
 
+    ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+    main_viewport->PlatformHandle = nullptr;
+    main_viewport->PlatformHandleRaw = nullptr;
+
     io.BackendPlatformName = nullptr;
     io.BackendPlatformUserData = nullptr;
     io.BackendFlags &= ~(ImGuiBackendFlags_HasMouseCursors | ImGuiBackendFlags_HasSetMousePos |
