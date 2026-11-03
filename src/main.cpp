@@ -73,6 +73,7 @@ int main(int argc, char* argv[]) {
     std::optional<std::filesystem::path> pistationSelfTestDir;
     std::optional<std::filesystem::path> pistationBootReportDir;
     std::optional<std::filesystem::path> pistationIpcSelfTestDir;
+    std::optional<std::filesystem::path> pistationRenderSelfTestDir;
     std::optional<std::filesystem::path> pistationLoadProbe;
     std::optional<std::filesystem::path> pistationLoadProbeReportDir;
 
@@ -111,6 +112,8 @@ int main(int argc, char* argv[]) {
                    "Run the PiStation synthetic guest ELF self-test and write reports there");
     app.add_option("--pistation-ipc-selftest", pistationIpcSelfTestDir,
                    "Run the PiStation synthetic IPC self-test and write reports there");
+    app.add_option("--pistation-render-selftest", pistationRenderSelfTestDir,
+                   "Present a synthetic blank frame through the real renderer and write reports");
     app.add_option("--pistation-load-probe", pistationLoadProbe,
                    "Map a plain ELF with the real Linker and relocate it without executing it");
     app.add_option("--pistation-load-probe-report", pistationLoadProbeReportDir,
@@ -191,6 +194,9 @@ int main(int argc, char* argv[]) {
     }
     if (pistationIpcSelfTestDir) {
         return PiStation::RunIpcSelfTest(*pistationIpcSelfTestDir);
+    }
+    if (pistationRenderSelfTestDir) {
+        return PiStation::RunRenderSelfTest(*pistationRenderSelfTestDir);
     }
     if (pistationLoadProbe) {
         return PiStation::RunModuleLoadProbe(

@@ -9,6 +9,8 @@ namespace PiStation {
 
 int RunIpcSelfTest(const std::filesystem::path& report_directory);
 
+int RunRenderSelfTest(const std::filesystem::path& report_directory);
+
 int RunModuleLoadProbe(const std::filesystem::path& module_path,
                        const std::filesystem::path& report_directory);
 

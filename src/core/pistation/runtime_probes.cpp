@@ -16,6 +16,12 @@
 #include "core/pistation/ipc_service_manager.h"
 #include "core/pistation/native_boot_backend.h"
 #include "core/pistation/runtime_probes.h"
+#include "input/controller.h"
+#include "sdl_window.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
+
+extern Frontend::WindowSDL* g_window;
 
 namespace PiStation {
 
@@ -248,6 +254,53 @@ int RunIpcSelfTest(const std::filesystem::path& report_directory) {
                    check.failed == 0 ? "pass" : "fail");
     backend.WriteReports();
     return check.failed == 0 ? 0 : 1;
+}
+
+int RunRenderSelfTest(const std::filesystem::path& report_directory) {
+    auto& backend = NativeBootBackend::Instance();
+    backend.Enable(report_directory);
+    Common::ElfInfo::Instance().InitializeSynthetic(Common::ElfInfo::FW_900);
+
+    auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
+    auto window = std::make_unique<Frontend::WindowSDL>(1280, 720, controllers,
+                                                        "PiStation synthetic render self-test");
+    if (!window->GetSDLWindow() || !window->IsOpen()) {
+        backend.RecordFailure("VULKAN", "window", "SDL window was not created");
+        return 1;
+    }
+    g_window = window.get();
+    backend.Record("PISTATION_BOOT", "window_created", "SDL window 1280x720", "ok");
+
+    int exit_code = 0;
+    {
+        auto liverpool = std::make_unique<AmdGpu::Liverpool>();
+        auto presenter = std::make_unique<Vulkan::Presenter>(*window, liverpool.get());
+        backend.Record("VULKAN", "renderer_initialized",
+                       "Vulkan instance, device, schedulers, swapchain and rasterizer constructed",
+                       "ok");
+        auto* frame = presenter->PrepareBlankFrame(false);
+        if (!frame) {
+            backend.RecordFailure("FRAMEBUFFER", "prepare_blank_frame", "returned null");
+            exit_code = 1;
+        } else {
+            presenter->Present(frame, false, false);
+            backend.Record("FRAMEBUFFER", "synthetic_blank_frame_presented",
+                           "blank frame prepared and submitted to the swapchain; this is not guest "
+                           "output",
+                           "ok");
+        }
+        backend.Record("VULKAN", "renderer_teardown",
+                       "not performed: destroying the presenter asserts in ImGui::DestroyContext "
+                       "(viewport PlatformUserData still set); the normal runtime never destroys "
+                       "it either, so both objects are left to process exit",
+                       "unsupported");
+        static_cast<void>(presenter.release());
+        static_cast<void>(liverpool.release());
+    }
+    static_cast<void>(window.release());
+    backend.WriteReports();
+    // Renderer threads cannot be joined (see above), so leave the way the normal runtime does.
+    std::quick_exit(exit_code);
 }
 
 int RunModuleLoadProbe(const std::filesystem::path& module_path,
