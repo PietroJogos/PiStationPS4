@@ -731,6 +731,8 @@ set(MISC_LIBS  src/core/libraries/screenshot/screenshot.cpp
                src/core/libraries/move/move.h
                src/core/libraries/move/move_error.h
                src/core/libraries/ipmi/ipmi.cpp
+               src/core/libraries/ipmi/ipmi_kernel.cpp
+               src/core/libraries/ipmi/ipmi_kernel.h
                src/core/libraries/ipmi/ipmimgr.cpp
                src/core/libraries/ipmi/ipmimgr.h
                src/core/libraries/ipmi/ipmi.h

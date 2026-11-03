@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstring>
+#include <array>
+#include <vector>
+#include <string>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -9,7 +13,7 @@
 #include <fmt/format.h>
 #include "common/elf_info.h"
 #include "common/singleton.h"
-#include "core/libraries/ipmi/ipmimgr.h"
+#include "core/libraries/ipmi/ipmi_kernel.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/libs.h"
 #include "core/linker.h"
@@ -207,53 +211,245 @@ void RunConcurrencyCheck(CheckLog& check) {
     check("concurrent_connections_released", manager.ConnectionCount() == 0);
 }
 
+struct IpmiHarness {
+    Libraries::Ipmi::IpmiKernel kernel{[](const void*, size_t) { return true; }};
+
+    template <typename T>
+    s32 Call(u64 op, s32 handle, s32& result, T& params) {
+        return kernel.Call(op, handle, &result, &params, sizeof(T));
+    }
+    s32 CallRaw(u64 op, s32 handle, s32& result, const void* params, u64 size) {
+        return kernel.Call(op, handle, &result, params, size);
+    }
+};
+
+s32 IpmiCreateServer(IpmiHarness& h, const char* name, u64 impl, s32& handle) {
+    using namespace Libraries::Ipmi;
+    IpmiServerConfig config{};
+    config.size = sizeof(config);
+    IpmiCreateParams params{impl, reinterpret_cast<u64>(name), reinterpret_cast<u64>(&config)};
+    handle = -1;
+    return h.Call(OpCreateServer, 0, handle, params);
+}
+
+s32 IpmiCreateClient(IpmiHarness& h, const char* name, s32& handle) {
+    using namespace Libraries::Ipmi;
+    IpmiClientConfig config{};
+    config.size = sizeof(config);
+    IpmiCreateParams params{0x1000, reinterpret_cast<u64>(name), reinterpret_cast<u64>(&config)};
+    handle = -1;
+    return h.Call(OpCreateClient, 0, handle, params);
+}
+
+// Serves one endpoint: accepts connections and answers synchronous calls by echoing the first
+// input buffer prefixed with "pong:". It uses only the kernel ABI, so every message really goes
+// through the kernel's packet queue.
+void IpmiServeLoop(IpmiHarness& h, s32 server_handle, std::atomic<bool>& stop,
+                   std::atomic<u32>& connections, std::atomic<u32>& calls) {
+    using namespace Libraries::Ipmi;
+    std::map<u64, s32> sessions;
+    u64 next_impl = 0x2000;
+    while (!stop) {
+        std::array<u8, 0x400> buffer{};
+        IpmiPacketInfo info{};
+        struct Args {
+            u64 buffer, size, info, unk;
+        } args{reinterpret_cast<u64>(buffer.data()), buffer.size(), reinterpret_cast<u64>(&info), 0};
+        s32 result = -1;
+        if (h.Call(OpServerReceivePacket, server_handle, result, args) != 0) {
+            return;
+        }
+        if (info.type == 1) {
+            struct UserData {
+                u64 size, data;
+            } user{sizeof(UserData), 0};
+            struct SessionArgs {
+                u64 impl, user;
+            } session_args{next_impl, reinterpret_cast<u64>(&user)};
+            s32 session = -1;
+            if (h.Call(OpCreateSession, 0, session, session_args) != 0) {
+                return;
+            }
+            sessions[next_impl++] = session;
+            s32 status = 0;
+            s32 ignored = -1;
+            h.CallRaw(OpSendConnectResult, session, ignored, &status, sizeof(status));
+            connections++;
+            continue;
+        }
+        IpmiSyncMessageHeader header;
+        std::memcpy(&header, buffer.data(), sizeof(header));
+        u32 in_length;
+        std::memcpy(&in_length, buffer.data() + sizeof(header), sizeof(in_length));
+        std::string reply = "pong:";
+        reply.append(reinterpret_cast<const char*>(buffer.data() + sizeof(header) + 4), in_length);
+        IpmiBufferInfo out{reinterpret_cast<u64>(reply.data()), reply.size(), reply.size()};
+        struct Respond {
+            s32 error_code;
+            u32 count;
+            u64 buffers;
+            u32 flags, padding;
+        } respond{0, 1, reinterpret_cast<u64>(&out), 0, 0};
+        s32 ignored = -1;
+        h.Call(OpSessionRespondSync, sessions.at(header.session_impl), ignored, respond);
+        calls++;
+    }
+}
+
+struct ClientSession {
+    s32 handle{-1};
+    s32 connect_status{-1};
+};
+
+s32 IpmiConnect(IpmiHarness& h, ClientSession& client) {
+    using namespace Libraries::Ipmi;
+    IpmiClientConnectParams params{};
+    params.status = reinterpret_cast<u64>(&client.connect_status);
+    s32 result = -1;
+    return h.Call(OpClientConnect, client.handle, result, params);
+}
+
+s32 IpmiInvoke(IpmiHarness& h, s32 client_handle, const std::string& input, std::string& output,
+               s32& method_result) {
+    using namespace Libraries::Ipmi;
+    IpmiDataInfo in{reinterpret_cast<u64>(input.data()), input.size()};
+    std::array<char, 64> out_storage{};
+    IpmiBufferInfo out{reinterpret_cast<u64>(out_storage.data()), out_storage.size(), 0};
+    IpmiSyncCallParams params{};
+    params.method = 7;
+    params.num_in_data = 1;
+    params.num_out_data = 1;
+    params.in_data = reinterpret_cast<u64>(&in);
+    params.out_data = reinterpret_cast<u64>(&out);
+    params.result = reinterpret_cast<u64>(&method_result);
+    params.flags = 0;
+    s32 result = -1;
+    const s32 error = h.Call(OpClientInvokeSync, client_handle, result, params);
+    output.assign(out_storage.data(), out.size);
+    return error;
+}
+
 void RunIpmiKernelChecks(CheckLog& check) {
     using namespace Libraries::Ipmi;
-    static const char ServiceName[] = "SyntheticService";
-    IpmiKernelManager kernel{[](u64 address) -> std::optional<std::string> {
-        if (address == reinterpret_cast<u64>(ServiceName)) {
-            return std::string{ServiceName};
-        }
-        return std::nullopt;
-    }};
-    s32 result = IpmiResultUnset;
-    const u64 create_args[3] = {0x1234, 0x5678, 0};
+    {
+        IpmiHarness h;
+        s32 server = -1;
+        s32 client = -1;
+        check("ipmi_absent_server_connect_enoent", [&] {
+            IpmiCreateClient(h, "NoSuchService", client);
+            ClientSession c{client};
+            return IpmiConnect(h, c) == POSIX_ENOENT && c.connect_status == -1;
+        }());
+        check("ipmi_create_server", IpmiCreateServer(h, "SyntheticIpmi", 0x1, server) == 0 &&
+                                        server > 0 && h.kernel.IsServerRegistered("SyntheticIpmi"));
+        s32 duplicate = -1;
+        check("ipmi_duplicate_server_rejected",
+              IpmiCreateServer(h, "SyntheticIpmi", 0x2, duplicate) == POSIX_EEXIST);
+        check("ipmi_server_name", [&] {
+            char name[32]{};
+            struct Args {
+                u64 name;
+            } args{reinterpret_cast<u64>(name)};
+            s32 result = -1;
+            return h.Call(OpServerGetName, server, result, args) == 0 &&
+                   std::string{name} == "SyntheticIpmi";
+        }());
+        check("ipmi_unreadable_name_efault", [&] {
+            IpmiClientConfig config{};
+            IpmiCreateParams params{0x1000, 0, reinterpret_cast<u64>(&config)};
+            s32 result = -1;
+            return h.Call(OpCreateClient, 0, result, params) == POSIX_EFAULT && result == -1;
+        }());
+        check("ipmi_wrong_params_size_einval", [&] {
+            u64 dummy[2]{};
+            s32 result = -1;
+            return h.CallRaw(OpCreateClient, 0, result, dummy, sizeof(dummy)) == POSIX_EINVAL;
+        }());
+        check("ipmi_invalid_handle_einval", [&] {
+            ClientSession c{9999};
+            return IpmiConnect(h, c) == POSIX_EINVAL;
+        }());
+        check("ipmi_unported_op_enosys", [&] {
+            u64 dummy[4]{};
+            s32 result = -1;
+            return h.CallRaw(0x251, client, result, dummy, 0x28) == POSIX_ENOSYS;
+        }());
+    }
 
-    check("ipmi_null_result_rejected",
-          kernel.Call(IpmiCreateOp, 0, nullptr, create_args, IpmiCreateArgsSize) == POSIX_EFAULT);
-    check("ipmi_create_wrong_size_rejected",
-          kernel.Call(IpmiCreateOp, 0, &result, create_args, 0x10) == POSIX_EINVAL &&
-              result == IpmiResultUnset);
-    const u64 null_config[3] = {0x1234, 0, 0};
-    check("ipmi_create_null_config_rejected",
-          kernel.Call(IpmiCreateOp, 0, &result, null_config, IpmiCreateArgsSize) == POSIX_EINVAL);
-    check("ipmi_create", kernel.Call(IpmiCreateOp, 0, &result, create_args, IpmiCreateArgsSize) ==
-                             0 && result > 0 && kernel.HandleCount() == 1);
-    const s32 first = result;
-    result = IpmiResultUnset;
-    check("ipmi_second_handle_differs",
-          kernel.Call(IpmiCreateOp, 0, &result, create_args, IpmiCreateArgsSize) == 0 &&
-              result > 0 && result != first && kernel.HandleCount() == 2);
-    result = IpmiResultUnset;
-    const u64 named_args[3] = {0x1234, reinterpret_cast<u64>(ServiceName), 0};
-    s32 named_result = IpmiResultUnset;
-    check("ipmi_create_records_service_name",
-          kernel.Call(IpmiCreateOp, 0, &named_result, named_args, IpmiCreateArgsSize) == 0 &&
-              kernel.ServiceNameOf(named_result) == std::string{ServiceName});
-    check("ipmi_unreadable_name_leaves_none", !kernel.ServiceNameOf(first).has_value());
-    check("ipmi_operation_names",
-          std::string{IpmiOperationName(0x310)} == "ClientImpl::disconnect" &&
-              std::string{IpmiOperationName(0x2)} == "ClientImpl::initialize (Client::create)" &&
-              IpmiOperationName(0x400) == nullptr);
-    check("ipmi_unknown_op_enosys",
-          kernel.Call(0x400, first, &result, create_args, 0x20) == POSIX_ENOSYS &&
-              result == IpmiResultUnset);
-    check("ipmi_destroy_with_args_rejected",
-          kernel.Call(IpmiDestroyOp, first, &result, create_args, 8) == POSIX_EINVAL);
-    check("ipmi_destroy", kernel.Call(IpmiDestroyOp, first, &result, nullptr, 0) == 0 &&
-                              result == 0 && kernel.HandleCount() == 2);
-    check("ipmi_destroy_twice_ebadf",
-          kernel.Call(IpmiDestroyOp, first, &result, nullptr, 0) == POSIX_EBADF);
+    {
+        IpmiHarness h;
+        s32 server = -1;
+        IpmiCreateServer(h, "SyntheticIpmi", 0x1, server);
+        std::atomic<bool> stop{false};
+        std::atomic<u32> connections{0};
+        std::atomic<u32> calls{0};
+        std::thread serve{[&] { IpmiServeLoop(h, server, stop, connections, calls); }};
+
+        constexpr u32 ClientCount = 4;
+        constexpr u32 CallsPerClient = 25;
+        std::atomic<u32> good{0};
+        std::atomic<u32> bad{0};
+        std::vector<std::thread> clients;
+        for (u32 i = 0; i < ClientCount; i++) {
+            clients.emplace_back([&, i] {
+                s32 handle = -1;
+                ClientSession c;
+                if (IpmiCreateClient(h, "SyntheticIpmi", handle) != 0) {
+                    bad += CallsPerClient;
+                    return;
+                }
+                c.handle = handle;
+                if (IpmiConnect(h, c) != 0 || c.connect_status != 0) {
+                    bad += CallsPerClient;
+                    return;
+                }
+                for (u32 n = 0; n < CallsPerClient; n++) {
+                    const std::string input = fmt::format("c{}-{}", i, n);
+                    std::string output;
+                    s32 method_result = -1;
+                    if (IpmiInvoke(h, handle, input, output, method_result) == 0 &&
+                        method_result == 0 && output == "pong:" + input) {
+                        good++;
+                    } else {
+                        bad++;
+                    }
+                }
+            });
+        }
+        for (auto& thread : clients) {
+            thread.join();
+        }
+        check("ipmi_connect_handshake_through_queue", connections == ClientCount,
+              fmt::format("connections={}", connections.load()));
+        check("ipmi_sync_calls_roundtrip", good == ClientCount * CallsPerClient && bad == 0,
+              fmt::format("good={} bad={}", good.load(), bad.load()));
+        check("ipmi_server_saw_every_call", calls == ClientCount * CallsPerClient);
+
+        stop = true;
+        s32 result = -1;
+        h.kernel.Shutdown();
+        serve.join();
+        check("ipmi_shutdown_stops_server_loop",
+              h.CallRaw(OpTrace, 0, result, nullptr, 0) == POSIX_ECONNABORTED);
+    }
+
+    {
+        IpmiHarness h;
+        s32 server = -1;
+        s32 client = -1;
+        IpmiCreateServer(h, "NobodyServes", 0x1, server);
+        IpmiCreateClient(h, "NobodyServes", client);
+        std::atomic<s32> outcome{-12345};
+        std::thread connecting{[&] {
+            ClientSession c{client};
+            outcome = IpmiConnect(h, c);
+        }};
+        std::this_thread::sleep_for(100ms);
+        check("ipmi_connect_blocks_until_server_answers", outcome == -12345);
+        h.kernel.Shutdown();
+        connecting.join();
+        check("ipmi_shutdown_wakes_blocked_connect", outcome == POSIX_ECONNABORTED);
+    }
 }
 
 } // namespace
