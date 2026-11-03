@@ -9,6 +9,8 @@
 #include <fmt/format.h>
 #include "common/elf_info.h"
 #include "common/singleton.h"
+#include "core/libraries/ipmi/ipmimgr.h"
+#include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/libs.h"
 #include "core/linker.h"
 #include "core/pistation/ipc_service_manager.h"
@@ -199,6 +201,39 @@ void RunConcurrencyCheck(CheckLog& check) {
     check("concurrent_connections_released", manager.ConnectionCount() == 0);
 }
 
+void RunIpmiKernelChecks(CheckLog& check) {
+    using namespace Libraries::Ipmi;
+    IpmiKernelManager kernel;
+    s32 result = IpmiResultUnset;
+    const u64 create_args[3] = {0x1234, 0x5678, 0};
+
+    check("ipmi_null_result_rejected",
+          kernel.Call(IpmiCreateOp, 0, nullptr, create_args, IpmiCreateArgsSize) == POSIX_EFAULT);
+    check("ipmi_create_wrong_size_rejected",
+          kernel.Call(IpmiCreateOp, 0, &result, create_args, 0x10) == POSIX_EINVAL &&
+              result == IpmiResultUnset);
+    const u64 null_config[3] = {0x1234, 0, 0};
+    check("ipmi_create_null_config_rejected",
+          kernel.Call(IpmiCreateOp, 0, &result, null_config, IpmiCreateArgsSize) == POSIX_EINVAL);
+    check("ipmi_create", kernel.Call(IpmiCreateOp, 0, &result, create_args, IpmiCreateArgsSize) ==
+                             0 && result > 0 && kernel.HandleCount() == 1);
+    const s32 first = result;
+    result = IpmiResultUnset;
+    check("ipmi_second_handle_differs",
+          kernel.Call(IpmiCreateOp, 0, &result, create_args, IpmiCreateArgsSize) == 0 &&
+              result > 0 && result != first && kernel.HandleCount() == 2);
+    result = IpmiResultUnset;
+    check("ipmi_unknown_op_enosys",
+          kernel.Call(0x400, first, &result, create_args, 0x20) == POSIX_ENOSYS &&
+              result == IpmiResultUnset);
+    check("ipmi_destroy_with_args_rejected",
+          kernel.Call(IpmiDestroyOp, first, &result, create_args, 8) == POSIX_EINVAL);
+    check("ipmi_destroy", kernel.Call(IpmiDestroyOp, first, &result, nullptr, 0) == 0 &&
+                              result == 0 && kernel.HandleCount() == 1);
+    check("ipmi_destroy_twice_ebadf",
+          kernel.Call(IpmiDestroyOp, first, &result, nullptr, 0) == POSIX_EBADF);
+}
+
 } // namespace
 
 int RunIpcSelfTest(const std::filesystem::path& report_directory) {
@@ -208,6 +243,7 @@ int RunIpcSelfTest(const std::filesystem::path& report_directory) {
     RunBasicChecks(check);
     RunDisconnectWakeCheck(check);
     RunConcurrencyCheck(check);
+    RunIpmiKernelChecks(check);
     backend.Record("IPC", "summary", fmt::format("passed={} failed={}", check.passed, check.failed),
                    check.failed == 0 ? "pass" : "fail");
     backend.WriteReports();
