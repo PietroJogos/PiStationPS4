@@ -1,0 +1,108 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <atomic>
+#include <string>
+#include <fmt/format.h>
+#include "common/logging/log.h"
+#include "core/libraries/ipmi/ipmimgr.h"
+#include "core/libraries/kernel/kernel.h"
+#include "core/libraries/kernel/posix_error.h"
+#include "core/memory.h"
+#include "core/pistation/native_boot_backend.h"
+
+namespace Libraries::Ipmi {
+
+namespace {
+
+std::string DescribeArgument(u64 value) {
+    constexpr u64 MaxText = 64;
+    auto* memory = Core::Memory::Instance();
+    if (value < 0x10000 || !memory->IsValidMapping(value, MaxText)) {
+        return fmt::format("{:#x}", value);
+    }
+    const auto* text = reinterpret_cast<const char*>(value);
+    std::string out;
+    for (u64 i = 0; i < MaxText && text[i] != '\0'; i++) {
+        if (text[i] < 0x20 || text[i] > 0x7e) {
+            return fmt::format("{:#x}", value);
+        }
+        out.push_back(text[i]);
+    }
+    return out.empty() ? fmt::format("{:#x}", value) : fmt::format("{:#x}:'{}'", value, out);
+}
+
+std::string DescribeArguments(const u64* args, u64 args_size) {
+    std::string out;
+    if (!args) {
+        return out;
+    }
+    for (u64 i = 0; i < args_size / sizeof(u64) && i < 6; i++) {
+        out += (i ? " " : "") + DescribeArgument(args[i]);
+    }
+    return out;
+}
+
+} // namespace
+
+s32 IpmiKernelManager::Call(u64 op, s32 handle, s32* result, const u64* args, u64 args_size) {
+    if (!result) {
+        return POSIX_EFAULT;
+    }
+    std::scoped_lock lk{mutex};
+    switch (op) {
+    case IpmiCreateOp: {
+        if (args_size != IpmiCreateArgsSize || !args || args[1] == 0) {
+            return POSIX_EINVAL;
+        }
+        const s32 id = next_handle++;
+        objects[id] = args[0];
+        *result = id;
+        return 0;
+    }
+    case IpmiDestroyOp: {
+        if (args_size != 0) {
+            return POSIX_EINVAL;
+        }
+        if (objects.erase(handle) == 0) {
+            return POSIX_EBADF;
+        }
+        *result = 0;
+        return 0;
+    }
+    default:
+        return POSIX_ENOSYS;
+    }
+}
+
+size_t IpmiKernelManager::HandleCount() const {
+    std::scoped_lock lk{mutex};
+    return objects.size();
+}
+
+IpmiKernelManager& GetIpmiKernelManager() {
+    static IpmiKernelManager manager;
+    return manager;
+}
+
+s32 PS4_SYSV_ABI ipmimgr_call(u64 op, s32 handle, s32* result, const u64* args, u64 args_size,
+                              u64 sentinel) {
+    static std::atomic<u32> traced{0};
+    const s32 error = GetIpmiKernelManager().Call(op, handle, result, args, args_size);
+    if (traced++ < 256) {
+        LOG_INFO(Lib_Kernel, "[IPMI] ipmimgr_call op={:#x} handle={} args_size={:#x} -> errno {}",
+                 op, handle, args_size, error);
+        PiStation::NativeBootBackend::Instance().Record(
+            "IPMI", "ipmimgr_call",
+            fmt::format("op={:#x} handle={} args_size={:#x} args=[{}]", op, handle, args_size,
+                        DescribeArguments(args, args_size)),
+            error == 0 ? "ok" : fmt::format("errno {}", error));
+    }
+    if (error != 0) {
+        *Libraries::Kernel::__Error() = error;
+        return -1;
+    }
+    return 0;
+}
+
+} // namespace Libraries::Ipmi
