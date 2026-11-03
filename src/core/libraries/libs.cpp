@@ -71,6 +71,8 @@
 #include "core/libraries/system/msgdialog.h"
 #include "core/libraries/system/systemservice.h"
 #include "core/libraries/system/userservice.h"
+#include "core/libraries/ipmi/ipmi.h"
+#include "core/pistation/native_boot_backend.h"
 #include "core/libraries/ulobjmgr/ulobjmgr.h"
 #include "core/libraries/usbd/usbd.h"
 #include "core/libraries/usbd/usbstorage.h"
@@ -184,6 +186,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceHmd.sprx", Libraries::Hmd::RegisterLib},
             {"libSceHmdSetupDialog.sprx", Libraries::HmdSetupDialog::RegisterLib},
             {"libSceDiscMap.sprx", Libraries::DiscMap::RegisterLib},
+            {"libSceIpmi.sprx", Libraries::Ipmi::RegisterLib},
             {"ulobjmgr.sprx", Libraries::Ulobjmgr::RegisterLib},
             {"libSceSigninDialog.sprx", Libraries::SigninDialog::RegisterLib},
             {"libSceCamera.sprx", Libraries::Camera::RegisterLib},
@@ -204,6 +207,13 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
         });
 
         for (auto mod : ModulesToLoad) {
+            if ((mod.module_name == "libSceGnmDriver.sprx" ||
+                 mod.module_name == "libSceVideoOut.sprx") &&
+                PiStation::NativeBootBackend::Instance().IsGraphicsHleSkipped()) {
+                LOG_INFO(Loader, "[PISTATION_BOOT] {} HLE skipped: headless probe",
+                         mod.module_name);
+                continue;
+            }
             if (mod.module_name == "libSceGnmDriver.sprx") {
                 auto lle_file = Kernel::sceKernelIsNeoMode() ? "libSceGnmDriverForNeoMode.sprx"
                                                              : mod.module_name;

@@ -10,7 +10,9 @@
 
 #include "common/logging/log.h"
 #include "core/aerolib/aerolib.h"
+#include "common/thread.h"
 #include "core/aerolib/stubs.h"
+#include "core/pistation/native_boot_backend.h"
 
 namespace Core::AeroLib {
 
@@ -30,6 +32,9 @@ static std::mutex g_stub_mutex;
 
 static u64 PS4_SYSV_ABI CommonStub(u64 index) {
     const auto& e = g_stub_entries[index];
+    PiStation::NativeBootBackend::Instance().RecordStubCall(
+        e.nid ? e.nid->name : "Unknown", e.nid ? e.nid->nid : e.nid_unknown,
+        Common::GetCurrentThreadName(), reinterpret_cast<u64>(__builtin_return_address(0)));
     if (e.nid) {
         LOG_ERROR(Core, "Stub: {} (nid: {}) called, returning zero to {}", e.nid->name, e.nid->nid,
                   __builtin_return_address(0));

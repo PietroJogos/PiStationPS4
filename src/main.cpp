@@ -23,6 +23,7 @@
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
 #include "core/pistation/native_boot_backend.h"
+#include "core/pistation/runtime_probes.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
@@ -71,6 +72,9 @@ int main(int argc, char* argv[]) {
     bool append_log{};
     std::optional<std::filesystem::path> pistationSelfTestDir;
     std::optional<std::filesystem::path> pistationBootReportDir;
+    std::optional<std::filesystem::path> pistationIpcSelfTestDir;
+    std::optional<std::filesystem::path> pistationLoadProbe;
+    std::optional<std::filesystem::path> pistationLoadProbeReportDir;
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
@@ -104,6 +108,12 @@ int main(int argc, char* argv[]) {
     app.add_flag("--show-fps", showFps);
     app.add_option("--pistation-synthetic-selftest", pistationSelfTestDir,
                    "Run the PiStation synthetic guest ELF self-test and write reports there");
+    app.add_option("--pistation-ipc-selftest", pistationIpcSelfTestDir,
+                   "Run the PiStation synthetic IPC self-test and write reports there");
+    app.add_option("--pistation-load-probe", pistationLoadProbe,
+                   "Map a plain ELF with the real Linker and relocate it without executing it");
+    app.add_option("--pistation-load-probe-report", pistationLoadProbeReportDir,
+                   "Report directory for --pistation-load-probe");
     app.add_option("--pistation-boot-report", pistationBootReportDir,
                    "Write PiStation native boot reports for this run to the directory");
     app.add_flag("--config-clean", configClean);
@@ -176,6 +186,13 @@ int main(int argc, char* argv[]) {
 
     if (pistationSelfTestDir) {
         return PiStation::RunSyntheticSelfTest(*pistationSelfTestDir);
+    }
+    if (pistationIpcSelfTestDir) {
+        return PiStation::RunIpcSelfTest(*pistationIpcSelfTestDir);
+    }
+    if (pistationLoadProbe) {
+        return PiStation::RunModuleLoadProbe(
+            *pistationLoadProbe, pistationLoadProbeReportDir.value_or("pistation_load_probe"));
     }
     if (pistationBootReportDir) {
         PiStation::NativeBootBackend::Instance().Enable(*pistationBootReportDir);

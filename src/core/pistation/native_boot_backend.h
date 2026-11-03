@@ -5,6 +5,7 @@
 
 #include <array>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -48,6 +49,18 @@ public:
     void RecordUnresolvedSymbol(const std::string& library, const std::string& module,
                                 const std::string& nid, const std::string& name);
 
+    void RecordStubCall(const std::string& name, const std::string& nid,
+                        const std::string& thread, u64 return_address);
+
+    void SkipGraphicsHle() {
+        graphics_hle_skipped = true;
+    }
+    bool IsGraphicsHleSkipped() const {
+        return graphics_hle_skipped;
+    }
+
+    void FinalizeReports(const char* reason);
+
     bool HasFailure() const;
     bool WriteReports() const;
 
@@ -61,9 +74,20 @@ private:
     std::filesystem::path report_directory;
     std::vector<BootEvent> events;
     std::vector<BootEvent> unresolved;
+    struct StubStat {
+        std::string name;
+        std::string nid;
+        std::string first_thread;
+        u64 first_return{};
+        u64 first_sequence{};
+        u64 calls{};
+    };
+    std::map<std::string, StubStat> stub_calls;
+    u64 stub_sequence{};
     std::array<PhaseRecord, static_cast<size_t>(BootPhase::Count)> phases{};
     BootEvent first_failure;
     bool has_failure{};
+    bool graphics_hle_skipped{};
 };
 
 std::vector<u8> BuildSyntheticGuestElf();

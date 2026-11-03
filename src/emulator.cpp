@@ -44,6 +44,7 @@
 #include "core/libraries/save_data/save_backup.h"
 #include "core/libraries/usbd/usbstorage.h"
 #include "core/linker.h"
+#include "core/pistation/native_boot_backend.h"
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
@@ -97,6 +98,7 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    PiStation::NativeBootBackend::Instance().FinalizeReports("emulator shutdown");
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();

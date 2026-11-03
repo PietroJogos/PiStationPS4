@@ -730,6 +730,8 @@ set(MISC_LIBS  src/core/libraries/screenshot/screenshot.cpp
                src/core/libraries/move/move.cpp
                src/core/libraries/move/move.h
                src/core/libraries/move/move_error.h
+               src/core/libraries/ipmi/ipmi.cpp
+               src/core/libraries/ipmi/ipmi.h
                src/core/libraries/ulobjmgr/ulobjmgr.cpp
                src/core/libraries/ulobjmgr/ulobjmgr.h
                src/core/libraries/signin_dialog/signindialog.cpp
@@ -1003,8 +1005,12 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/memory.h
          src/core/module.cpp
          src/core/module.h
+         src/core/pistation/ipc_service_manager.cpp
+         src/core/pistation/ipc_service_manager.h
          src/core/pistation/native_boot_backend.cpp
          src/core/pistation/native_boot_backend.h
+         src/core/pistation/runtime_probes.cpp
+         src/core/pistation/runtime_probes.h
          src/core/platform.h
          src/core/signals.cpp
          src/core/signals.h

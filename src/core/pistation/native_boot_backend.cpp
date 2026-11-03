@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <fmt/format.h>
@@ -46,9 +47,20 @@ NativeBootBackend& NativeBootBackend::Instance() {
 }
 
 void NativeBootBackend::Enable(std::filesystem::path directory) {
-    std::scoped_lock lk{mutex};
-    report_directory = std::move(directory);
-    enabled = true;
+    {
+        std::scoped_lock lk{mutex};
+        report_directory = std::move(directory);
+        enabled = true;
+    }
+    static const bool exit_hooks_registered = [] {
+        const auto finalize = [] {
+            NativeBootBackend::Instance().FinalizeReports("exit handler");
+        };
+        std::at_quick_exit(finalize);
+        std::atexit(finalize);
+        return true;
+    }();
+    static_cast<void>(exit_hooks_registered);
 }
 
 bool NativeBootBackend::IsEnabled() const {
@@ -124,6 +136,14 @@ void NativeBootBackend::RecordFailure(std::string tag, std::string operation, st
     WriteReports();
 }
 
+void NativeBootBackend::FinalizeReports(const char* reason) {
+    if (!IsEnabled()) {
+        return;
+    }
+    Record("PROCESS", "process_exit", reason, "observed");
+    WriteReports();
+}
+
 void NativeBootBackend::RecordUnresolvedSymbol(const std::string& library,
                                                const std::string& module, const std::string& nid,
                                                const std::string& name) {
@@ -133,6 +153,25 @@ void NativeBootBackend::RecordUnresolvedSymbol(const std::string& library,
     }
     unresolved.push_back(
         {"LINKER", "unresolved_symbol", fmt::format("{}:{}:{}", library, module, nid), name});
+}
+
+void NativeBootBackend::RecordStubCall(const std::string& name, const std::string& nid,
+                                       const std::string& thread, u64 return_address) {
+    constexpr size_t MaxTrackedStubs = 8192;
+    std::scoped_lock lk{mutex};
+    if (!enabled) {
+        return;
+    }
+    const auto it = stub_calls.find(nid);
+    if (it != stub_calls.end()) {
+        it->second.calls++;
+        stub_sequence++;
+        return;
+    }
+    if (stub_calls.size() >= MaxTrackedStubs) {
+        return;
+    }
+    stub_calls[nid] = {name, nid, thread, return_address, stub_sequence++, 1};
 }
 
 bool NativeBootBackend::WriteReports() const {
@@ -161,6 +200,22 @@ bool NativeBootBackend::WriteReports() const {
         json["unresolved_symbols"].push_back(EventToJson(event));
     }
 
+    std::vector<const StubStat*> ordered;
+    for (const auto& [nid, stat] : stub_calls) {
+        ordered.push_back(&stat);
+    }
+    std::ranges::sort(ordered, {}, &StubStat::first_sequence);
+    json["stub_calls"] = nlohmann::json::array();
+    for (const auto* stat : ordered) {
+        json["stub_calls"].push_back({{"name", stat->name},
+                                      {"nid", stat->nid},
+                                      {"calls", stat->calls},
+                                      {"first_sequence", stat->first_sequence},
+                                      {"first_thread", stat->first_thread},
+                                      {"first_return_address", fmt::format("{:#x}", stat->first_return)},
+                                      {"implemented", false}});
+    }
+
     bool ok = true;
     {
         std::ofstream out(report_directory / "native_boot_report.json", std::ios::trunc);
@@ -182,6 +237,11 @@ bool NativeBootBackend::WriteReports() const {
                 << " " << first_failure.detail << '\n';
         }
         out << "unresolved symbols: " << unresolved.size() << '\n';
+        out << "stub functions actually called: " << ordered.size() << '\n';
+        for (const auto* stat : ordered) {
+            out << "  #" << stat->first_sequence << " " << stat->name << " calls=" << stat->calls
+                << " first_thread=" << stat->first_thread << '\n';
+        }
         for (const auto& event : events) {
             out << '[' << event.tag << "] " << event.operation << ' ' << event.detail << " -> "
                 << event.result << '\n';
